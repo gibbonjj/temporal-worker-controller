@@ -60,6 +60,10 @@ spec:
                 required:
                 - name
                 type: object
+              workerGroup:
+                maxLength: 24
+                pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                type: string
             required:
             - template
             type: object
@@ -111,6 +115,10 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              observedGeneration:
+                format: int64
+                minimum: 0
+                type: integer
               versions:
                 items:
                   properties:

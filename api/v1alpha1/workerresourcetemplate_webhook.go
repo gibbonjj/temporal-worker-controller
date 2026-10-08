@@ -13,6 +13,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -167,6 +168,8 @@ func (v *WorkerResourceTemplateValidator) validate(ctx context.Context, oldWRT, 
 		)
 	}
 
+	warnings = append(warnings, v.groupWarnings(ctx, newWRT)...)
+
 	// API-dependent checks (RESTMapper scope + SubjectAccessReview)
 	apiWarnings, apiErrs := v.validateWithAPI(ctx, newWRT, verb)
 	warnings = append(warnings, apiWarnings...)
@@ -181,6 +184,23 @@ func (v *WorkerResourceTemplateValidator) validate(ctx context.Context, oldWRT, 
 	}
 
 	return warnings, nil
+}
+
+// groupWarnings warns when the WRT's group is not declared by its WorkerDeployment. It is
+// not an error, since the group may be added to the WorkerDeployment after the WRT.
+func (v *WorkerResourceTemplateValidator) groupWarnings(ctx context.Context, wrt *WorkerResourceTemplate) admission.Warnings {
+	if v.Client == nil {
+		return nil
+	}
+	var wd WorkerDeployment
+	key := types.NamespacedName{Namespace: wrt.Namespace, Name: wrt.Spec.EffectiveWorkerDeploymentName()}
+	if err := v.Client.Get(ctx, key, &wd); err != nil || wd.Spec.HasWorkerGroup(wrt.Spec.EffectiveWorkerGroup()) {
+		return nil
+	}
+	if wrt.Spec.WorkerGroup == "" {
+		return admission.Warnings{fmt.Sprintf("WorkerDeployment %q uses worker groups; set spec.workerGroup", wd.Name)}
+	}
+	return admission.Warnings{fmt.Sprintf("spec.workerGroup %q is not declared by WorkerDeployment %q", wrt.Spec.WorkerGroup, wd.Name)}
 }
 
 // validateWorkerResourceTemplateSpec performs pure (no-API) validation of the spec fields.
@@ -323,6 +343,18 @@ func validateWorkerResourceTemplateSpec(spec WorkerResourceTemplateSpec, allowed
 		// (workerDeploymentName + workerDeploymentBuildId). Allow empty-string opt-in ("") and
 		// reject any other value.
 		checkKEDATriggerMetadata(innerSpec, innerSpecPath, &allErrs)
+
+		// 9. spec.targetRef: the controller owns this exact path. If {}, the controller injects
+		// the versioned Deployment; if non-empty, reject, because every rendered copy would point
+		// at the same Deployment.
+		if tr, exists := innerSpec["targetRef"]; exists && tr != nil && !isEmptyMap(tr) {
+			allErrs = append(allErrs, field.Forbidden(
+				innerSpecPath.Child("targetRef"),
+				"if targetRef is present, the controller owns it and will set it to point at the "+
+					"versioned Deployment; set it to {} to opt in to auto-injection, "+
+					"or remove it entirely if you do not need the targetRef field",
+			))
+		}
 	}
 
 	return warnings, allErrs

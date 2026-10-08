@@ -20,17 +20,20 @@ This is also the recommended mechanism for metric-based or backlog-based autosca
 
 ## Auto-injection
 
-The controller auto-injects two fields when you set them to `{}` (empty object) in `spec.template`. `{}` is the explicit opt-in sentinel:
+The controller auto-injects the fields below when you set them to `{}` (empty object) in `spec.template`. `{}` is the explicit opt-in sentinel:
 - If you omit the field entirely, nothing is injected.
 - If you set a non-empty value, the webhook rejects the `WorkerResourceTemplate` because the controller owns these fields.
 
 | Field | Scope | Injected value                                                                                                              |
 |-------|-------|-----------------------------------------------------------------------------------------------------------------------------|
 | `scaleTargetRef` | Anywhere in `spec` (recursive) | `{apiVersion: apps/v1, kind: Deployment, name: <versioned-deployment-name>}`                                                |
-| `spec.selector.matchLabels` | Only at this exact path | `{temporal.io/build-id: <buildID>, temporal.io/deployment-name: <wdName>}`                                                  |
+| `spec.targetRef` | Only at this exact path | `{apiVersion: apps/v1, kind: Deployment, name: <versioned-deployment-name>}`                                                |
+| `spec.selector.matchLabels` | Only at this exact path | `{temporal.io/build-id: <buildID>, temporal.io/deployment-name: <wdName>}`, plus `temporal.io/worker-group: <group>` for versions with worker groups |
 | `spec.metrics[*].external.metric.selector.matchLabels` | Each External metric entry where `matchLabels` is present | `{temporal_worker_deployment_name: <ns>_<wd-name>, temporal_worker_build_id: <buildID>, temporal_namespace: <temporal-ns>}` |
 
 `scaleTargetRef` injection is recursive and covers HPAs, WPAs, and other autoscaler CRDs.
+
+`spec.targetRef` covers VerticalPodAutoscalers, which name their target in `spec.targetRef` instead of `scaleTargetRef`.
 
 `spec.selector.matchLabels` uses `{}` as the opt-in sentinel — absent means no injection; `{}` means inject pod selector labels.
 
@@ -39,6 +42,37 @@ The controller auto-injects two fields when you set them to `{}` (empty object) 
 For metrics backends that use Temporal Server's native label names, set the Helm value `workerResourceTemplate.hpaMatchLabelsStripTemporalPrefix: true` (or run the controller with `--wrt-hpa-match-labels-strip-temporal-prefix`). The controller will inject `worker_deployment_name`, `worker_build_id`, and `namespace` instead.
 
 The webhook rejects any template that hardcodes `temporal_worker_deployment_name`, `temporal_worker_build_id`, or `temporal_namespace` in a metric selector — these are always controller-owned. When prefix stripping is enabled, it also rejects `worker_deployment_name`, `worker_build_id`, and `namespace`.
+
+## Template variables
+
+Any string in `spec.template` may contain these tokens. The controller replaces them on each rendered copy:
+
+| Token | Value |
+|-------|-------|
+| `{{temporal_worker_deployment_name}}` | `<ns>_<wd-name>` |
+| `{{temporal_worker_build_id}}` | `<buildID>` |
+| `{{temporal_namespace}}` | `<temporal-ns>` |
+
+The values are the same ones appended to `spec.metrics[*].external.metric.selector.matchLabels`. The controller replaces the exact token, the same way an empty `matchLabels: {}` or `""` opts in to injection.
+
+When `workerResourceTemplate.hpaMatchLabelsStripTemporalPrefix` is enabled, the tokens are `{{worker_deployment_name}}`, `{{worker_build_id}}`, and `{{namespace}}`, matching the injected matchLabels.
+
+Use the tokens in KEDA triggers whose query is a single string (`prometheus`, `datadog`, `dynatrace`, and others) so each ScaledObject filters metrics to one worker version. See [examples/wrt-keda-prometheus.yaml](../examples/wrt-keda-prometheus.yaml).
+
+## Worker groups
+
+A `WorkerResourceTemplate` targets one [worker group](worker-groups.md). Set `spec.workerGroup` to the group's name; it is required when the `WorkerDeployment` uses groups. The controller renders one copy per version that has that group, pointing at that group's Deployment:
+
+```yaml
+spec:
+  workerDeploymentRef:
+    name: documents
+  workerGroup: parse
+```
+
+Create one `WorkerResourceTemplate` per group you want to autoscale. If no version has the group and the `WorkerDeployment` does not declare it, or `spec.workerGroup` is missing on a `WorkerDeployment` with groups, the `Ready` condition is `False` with reason `WorkerGroupNotFound`. The webhook warns about both.
+
+Backlog metrics are tagged with the deployment name and Build ID, not the group. Add `task_queue` to `matchLabels` so each group scales on its own queue.
 
 ## Resource naming
 
@@ -161,6 +195,43 @@ spec:
       # {} tells the controller to auto-inject {temporal.io/build-id, temporal.io/deployment-name}.
       selector:
         matchLabels: {}
+```
+
+## Example: VerticalPodAutoscaler per worker version
+
+> **Note:** VerticalPodAutoscaler must be installed in the cluster separately before you add it to `allowedResources`. The Temporal Worker Controller does not install it. See the [VPA installation guide](https://github.com/kubernetes/autoscaler/blob/master/vertical-pod-autoscaler/docs/installation.md).
+
+VerticalPodAutoscaler is not in the default allowed list. Add it to `workerResourceTemplate.allowedResources` first:
+
+```yaml
+workerResourceTemplate:
+  allowedResources:
+    - kinds: ["HorizontalPodAutoscaler"]
+      apiGroups: ["autoscaling"]
+      resources: ["horizontalpodautoscalers"]
+    - kinds: ["VerticalPodAutoscaler"]
+      apiGroups: ["autoscaling.k8s.io"]
+      resources: ["verticalpodautoscalers"]
+```
+
+```yaml
+apiVersion: temporal.io/v1alpha1
+kind: WorkerResourceTemplate
+metadata:
+  name: my-worker-vpa
+  namespace: my-namespace
+spec:
+  workerDeploymentRef:
+    name: my-worker
+  template:
+    apiVersion: autoscaling.k8s.io/v1
+    kind: VerticalPodAutoscaler
+    spec:
+      # {} tells the controller to auto-inject the versioned Deployment reference.
+      targetRef: {}
+      updatePolicy:
+        # Initial sets requests only when a pod is created, so VPA never evicts a running worker.
+        updateMode: "Initial"
 ```
 
 ## Checking status

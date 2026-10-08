@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -270,68 +271,51 @@ func (r *WorkerDeploymentReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	// finalizer from the previously-referenced connection if no other WD uses it.
 	// The new connection is already protected by ensureConnectionFinalizer above,
 	// so the WD is never left unprotected.
-	if workerDeploy.Generation != workerDeploy.Status.ObservedGeneration {
-		current := workerDeploy.Spec.WorkerOptions.ConnectionRef
-		if observed := workerDeploy.Status.ObservedConnectionRef; observed != nil && !sameConnectionRef(*observed, current) {
-			if err := r.releaseConnectionFinalizerIfUnused(ctx, l, *observed, workerDeploy.Namespace, workerDeploy.Name); err != nil {
-				return ctrl.Result{}, err
-			}
+	//
+	// This compares the observed ref directly rather than first gating on
+	// generation != observedGeneration. Blocked reconciles now advance
+	// observedGeneration (see recordWarningAndSetBlocked), so a connectionRef change
+	// whose first reconcile was blocked (by repointing at a Connection that does not
+	// exist yet for example) would otherwise never be noticed again and the old connection
+	// would keep the finalizer forever. ObservedConnectionRef is only written on a
+	// successful reconcile, so it remains the correct thing to compare against.
+	current := workerDeploy.Spec.WorkerOptions.ConnectionRef
+	if observed := workerDeploy.Status.ObservedConnectionRef; observed != nil && !sameConnectionRef(*observed, current) {
+		if err := r.releaseConnectionFinalizerIfUnused(ctx, l, *observed, workerDeploy.Namespace, workerDeploy.Name); err != nil {
+			return ctrl.Result{}, err
 		}
 	}
 
-	if err := connection.Spec.Validate(); err != nil {
-		l.Error(err, "connection spec not valid")
-		// TODO(jaypipes): As of TWC release <=v1.8.1, the only validation
-		// error for the connection spec is that the authentication secret is
-		// not valid. Revisit this warning reason when there are more potential
-		// validation failures.
-		r.recordWarningAndSetBlocked(ctx, &workerDeploy,
-			temporaliov1alpha1.ReasonAuthSecretInvalid,
-			fmt.Sprintf("Unable to resolve auth secret from Connection %q: %v", connObj.GetName(), err),
-			fmt.Sprintf("Unable to resolve auth secret: %v", err))
-		return ctrl.Result{}, err
-	}
-
-	// Get the Auth Mode and Secret Name
-	authMode := connection.Spec.AuthMode()
-	secretName := connection.Spec.SecretName()
-
-	// Get or update temporal client for connection
-	clientPoolKey := clientpool.ClientPoolKey{
-		HostPort:            connection.Spec.HostPort,
-		TLSServerName:       connection.Spec.TLSServerName(),
-		Namespace:           workerDeploy.Spec.WorkerOptions.TemporalNamespace,
-		SecretName:          secretName,
-		TLSCACertSecretName: connection.Spec.TLSCACertSecretName(),
-		AuthMode:            authMode,
-	}
-	temporalClient, ok := r.TemporalClientPool.GetSDKClient(clientPoolKey)
-	if !ok {
-		clientOpts, key, clientAuth, err := r.TemporalClientPool.ParseClientSecret(ctx, secretName, authMode, clientpool.NewClientOptions{
-			K8sNamespace:      workerDeploy.Namespace,
-			TemporalNamespace: workerDeploy.Spec.WorkerOptions.TemporalNamespace,
-			Spec:              connection.Spec,
-			Identity:          getControllerIdentity(),
-		})
-		if err != nil {
+	temporalClient, clientPoolKey, err := r.TemporalClientPool.GetClient(ctx,
+		connection.Spec,
+		workerDeploy.Spec.WorkerOptions.TemporalNamespace,
+		workerDeploy.Namespace,
+		getControllerIdentity(),
+	)
+	if err != nil {
+		var authErr *clientpool.AuthConfigError
+		var dialErr *clientpool.DialError
+		switch {
+		case errors.As(err, &authErr):
 			l.Error(err, "invalid Temporal auth secret")
 			r.recordWarningAndSetBlocked(ctx, &workerDeploy,
 				temporaliov1alpha1.ReasonAuthSecretInvalid,
 				fmt.Sprintf("Invalid Temporal auth secret for %s:%s: %v", connection.Spec.HostPort, workerDeploy.Spec.WorkerOptions.TemporalNamespace, err),
 				fmt.Sprintf("Invalid auth secret: %v", err))
-			return ctrl.Result{}, err
-		}
-
-		c, err := r.TemporalClientPool.DialAndUpsertClient(*clientOpts, *key, *clientAuth)
-		if err != nil {
+		case errors.As(err, &dialErr):
 			l.Error(err, "unable to create TemporalClient")
 			r.recordWarningAndSetBlocked(ctx, &workerDeploy,
 				temporaliov1alpha1.ReasonTemporalClientCreationFailed,
 				fmt.Sprintf("Unable to create Temporal client for %s:%s: %v", connection.Spec.HostPort, workerDeploy.Spec.WorkerOptions.TemporalNamespace, err),
 				fmt.Sprintf("Failed to connect to Temporal: %v", err))
-			return ctrl.Result{}, err
+		default:
+			l.Error(err, "unable to create TemporalClient")
+			r.recordWarningAndSetBlocked(ctx, &workerDeploy,
+				temporaliov1alpha1.ReasonTemporalClientCreationFailed,
+				fmt.Sprintf("Unable to create Temporal client for %s:%s: %v", connection.Spec.HostPort, workerDeploy.Spec.WorkerOptions.TemporalNamespace, err),
+				fmt.Sprintf("Failed to connect to Temporal: %v", err))
 		}
-		temporalClient = c
+		return ctrl.Result{}, err
 	}
 
 	workerDeploymentName := k8s.ComputeWorkerDeploymentName(&workerDeploy)
@@ -356,7 +340,7 @@ func (r *WorkerDeploymentReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		temporalClient,
 		workerDeploymentName,
 		workerDeploy.Spec.WorkerOptions.TemporalNamespace,
-		k8sState.Deployments,
+		k8sState.BuildIDs(),
 		targetBuildID,
 		workerDeploy.Spec.RolloutStrategy.Strategy,
 		getControllerIdentity(),
@@ -432,7 +416,7 @@ func (r *WorkerDeploymentReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	// target version has become current, this also factors in whether workers are
 	// actively polling Temporal into ConditionProgressing (Ready itself remains
 	// about rollout completion only).
-	r.syncConditions(&workerDeploy, temporalState)
+	r.syncConditions(&workerDeploy, temporalState, plan.BlockedReason)
 
 	// Single status write per reconcile: persists the generated status and
 	// conditions set during this loop (Ready, Progressing). Do not send the update
@@ -580,6 +564,24 @@ func (r *WorkerDeploymentReconciler) markWRTsWDNotFound(ctx context.Context, wd 
 			Message:            fmt.Sprintf("WorkerDeployment %q not found", wd.Name),
 			ObservedGeneration: wrt.Generation,
 		})
+		// Reconciling, not Stalled: a WRT that references a WorkerDeployment which does
+		// not exist yet is an expected, self-resolving state during creation ordering.
+		// Reporting Failed here would abort any install that applies the WRT before the WD.
+		meta.SetStatusCondition(&wrt.Status.Conditions, metav1.Condition{
+			Type:               temporaliov1alpha1.ConditionStalled,
+			Status:             metav1.ConditionFalse,
+			Reason:             temporaliov1alpha1.ReasonWRTWDNotFound,
+			Message:            fmt.Sprintf("WorkerDeployment %q not found", wd.Name),
+			ObservedGeneration: wrt.Generation,
+		})
+		meta.SetStatusCondition(&wrt.Status.Conditions, metav1.Condition{
+			Type:               temporaliov1alpha1.ConditionReconciling,
+			Status:             metav1.ConditionTrue,
+			Reason:             temporaliov1alpha1.ReasonWRTWDNotFound,
+			Message:            fmt.Sprintf("WorkerDeployment %q not found", wd.Name),
+			ObservedGeneration: wrt.Generation,
+		})
+		wrt.Status.ObservedGeneration = wrt.Generation
 		if err := r.Status().Update(ctx, wrt); err != nil {
 			l.Error(err, "unable to update WorkerResourceTemplate status for missing WorkerDeployment",
 				"WorkerResourceTemplate", wrt.Name, "WorkerDeployment", wd.Name)
@@ -613,42 +615,14 @@ func (r *WorkerDeploymentReconciler) handleDeletion(
 	}
 	connection := temporaliov1alpha1.Connection{Spec: connSpec}
 
-	if err := connection.Spec.Validate(); err != nil {
-		// TODO(jaypipes): As of TWC release <=v1.8.1, the only validation
-		// error for the connection spec is that the authentication secret is
-		// not valid. Revisit this error wrap when there are more potential
-		// validation failures.
-		return fmt.Errorf("unable to resolve auth secret name: %w", err)
-	}
-
-	authMode := connection.Spec.AuthMode()
-	secretName := connection.Spec.SecretName()
-
-	clientPoolKey := clientpool.ClientPoolKey{
-		HostPort:            connection.Spec.HostPort,
-		TLSServerName:       connection.Spec.TLSServerName(),
-		Namespace:           workerDeploy.Spec.WorkerOptions.TemporalNamespace,
-		SecretName:          secretName,
-		TLSCACertSecretName: connection.Spec.TLSCACertSecretName(),
-		AuthMode:            authMode,
-	}
-
-	temporalClient, ok := r.TemporalClientPool.GetSDKClient(clientPoolKey)
-	if !ok {
-		clientOpts, key, clientAuth, err := r.TemporalClientPool.ParseClientSecret(ctx, secretName, authMode, clientpool.NewClientOptions{
-			K8sNamespace:      workerDeploy.Namespace,
-			TemporalNamespace: workerDeploy.Spec.WorkerOptions.TemporalNamespace,
-			Spec:              connection.Spec,
-			Identity:          getControllerIdentity(),
-		})
-		if err != nil {
-			return fmt.Errorf("unable to parse Temporal auth secret: %w", err)
-		}
-		c, err := r.TemporalClientPool.DialAndUpsertClient(*clientOpts, *key, *clientAuth)
-		if err != nil {
-			return fmt.Errorf("unable to create TemporalClient: %w", err)
-		}
-		temporalClient = c
+	temporalClient, clientPoolKey, err := r.TemporalClientPool.GetClient(ctx,
+		connection.Spec,
+		workerDeploy.Spec.WorkerOptions.TemporalNamespace,
+		workerDeploy.Namespace,
+		getControllerIdentity(),
+	)
+	if err != nil {
+		return fmt.Errorf("unable to create TemporalClient: %w", err)
 	}
 
 	// Evict cached SDK clients on failures that indicate the cached client may
@@ -786,11 +760,41 @@ func (r *WorkerDeploymentReconciler) setCondition(
 func (r *WorkerDeploymentReconciler) syncConditions(
 	twd *temporaliov1alpha1.WorkerDeployment,
 	temporalState *temporal.TemporalWorkerState,
+	blockedReason string,
 ) {
 	// Deprecated: set ConnectionHealthy=True on all successful reconciles for v1.3.x compat.
 	r.setCondition(twd, temporaliov1alpha1.ConditionConnectionHealthy, //nolint:staticcheck // backward compat
 		metav1.ConditionTrue, temporaliov1alpha1.ReasonConnectionHealthy, //nolint:staticcheck // backward compat
 		"Connection is healthy and auth secret is resolved")
+
+	// A blocked spec owns Ready, Progressing and the kstatus conditions, so the rollout
+	// state below must not flip them back and forth every reconcile. InvalidSpec is in
+	// stalledReasons: only a spec change can clear it.
+	if blockedReason != "" {
+		readyChanged := r.setCondition(twd, temporaliov1alpha1.ConditionReady,
+			metav1.ConditionFalse, temporaliov1alpha1.ReasonInvalidSpec, blockedReason)
+		progressingChanged := r.setCondition(twd, temporaliov1alpha1.ConditionProgressing,
+			metav1.ConditionFalse, temporaliov1alpha1.ReasonInvalidSpec, blockedReason)
+		r.setCondition(twd, temporaliov1alpha1.ConditionStalled,
+			metav1.ConditionTrue, temporaliov1alpha1.ReasonInvalidSpec, blockedReason)
+		r.setCondition(twd, temporaliov1alpha1.ConditionReconciling,
+			metav1.ConditionFalse, temporaliov1alpha1.ReasonInvalidSpec, blockedReason)
+		if readyChanged || progressingChanged {
+			r.Recorder.Event(twd, corev1.EventTypeWarning, temporaliov1alpha1.ReasonInvalidSpec, blockedReason)
+		}
+		return
+	}
+
+	// Reaching this point means the reconcile completed without a blocking error,
+	// so nothing is stalled whatever stage the rollout is at. Set above the switch
+	// rather than in each arm for the same reason ConnectionHealthy is: the value does
+	// not vary by rollout state, and repeating it per arm invites one arm to drift.
+	//
+	// SetStatusCondition only upserts, so a Stalled=True from an earlier blocked reconcile
+	// stays until something sets it False.
+	r.setCondition(twd, temporaliov1alpha1.ConditionStalled,
+		metav1.ConditionFalse, temporaliov1alpha1.ReasonReconcileSucceeded,
+		"Reconcile succeeded")
 
 	switch twd.Status.TargetVersion.Status {
 	case temporaliov1alpha1.VersionStatusCurrent:
@@ -801,6 +805,13 @@ func (r *WorkerDeploymentReconciler) syncConditions(
 		r.setCondition(twd, temporaliov1alpha1.ConditionReady,
 			metav1.ConditionTrue, temporaliov1alpha1.ReasonRolloutComplete,
 			fmt.Sprintf("Rollout complete for buildID %s", twd.Status.TargetVersion.BuildID))
+
+		r.setCondition(twd, temporaliov1alpha1.ConditionProgressing,
+			metav1.ConditionFalse, temporaliov1alpha1.ReasonRolloutComplete,
+			fmt.Sprintf("Target version %s is current", twd.Status.TargetVersion.BuildID))
+		r.setCondition(twd, temporaliov1alpha1.ConditionReconciling,
+			metav1.ConditionFalse, temporaliov1alpha1.ReasonRolloutComplete,
+			fmt.Sprintf("Target version %s is current", twd.Status.TargetVersion.BuildID))
 
 		r.setConditionProgressingForCurrent(twd, temporalState)
 
@@ -818,11 +829,28 @@ func (r *WorkerDeploymentReconciler) syncConditions(
 		r.setCondition(twd, temporaliov1alpha1.ConditionProgressing,
 			metav1.ConditionTrue, temporaliov1alpha1.ReasonRamping,
 			fmt.Sprintf("Target version %s is receiving a percentage of new workflows", twd.Status.TargetVersion.BuildID))
+		r.setCondition(twd, temporaliov1alpha1.ConditionReconciling,
+			metav1.ConditionTrue, temporaliov1alpha1.ReasonRamping,
+			fmt.Sprintf("Target version %s is receiving a percentage of new workflows", twd.Status.TargetVersion.BuildID))
 	case temporaliov1alpha1.VersionStatusInactive:
+		if pending := pendingTargetGroups(twd); len(pending) > 0 {
+			msg := fmt.Sprintf("Target version %s is registered but these groups are not available yet: %s",
+				twd.Status.TargetVersion.BuildID, strings.Join(pending, ", "))
+			r.setCondition(twd, temporaliov1alpha1.ConditionReady,
+				metav1.ConditionFalse, temporaliov1alpha1.ReasonWaitingForPollers, msg)
+			r.setCondition(twd, temporaliov1alpha1.ConditionProgressing,
+				metav1.ConditionTrue, temporaliov1alpha1.ReasonWaitingForPollers, msg)
+			r.setCondition(twd, temporaliov1alpha1.ConditionReconciling,
+				metav1.ConditionTrue, temporaliov1alpha1.ReasonWaitingForPollers, msg)
+			break
+		}
 		r.setCondition(twd, temporaliov1alpha1.ConditionReady,
 			metav1.ConditionFalse, temporaliov1alpha1.ReasonWaitingForPromotion,
 			fmt.Sprintf("Target version %s is registered but not yet promoted", twd.Status.TargetVersion.BuildID))
 		r.setCondition(twd, temporaliov1alpha1.ConditionProgressing,
+			metav1.ConditionTrue, temporaliov1alpha1.ReasonWaitingForPromotion,
+			fmt.Sprintf("Target version %s is waiting for promotion to current", twd.Status.TargetVersion.BuildID))
+		r.setCondition(twd, temporaliov1alpha1.ConditionReconciling,
 			metav1.ConditionTrue, temporaliov1alpha1.ReasonWaitingForPromotion,
 			fmt.Sprintf("Target version %s is waiting for promotion to current", twd.Status.TargetVersion.BuildID))
 	default: // NotRegistered or unset: workers have not started polling yet
@@ -832,12 +860,72 @@ func (r *WorkerDeploymentReconciler) syncConditions(
 		r.setCondition(twd, temporaliov1alpha1.ConditionProgressing,
 			metav1.ConditionTrue, temporaliov1alpha1.ReasonWaitingForPollers,
 			fmt.Sprintf("Waiting for workers with buildID %s to start polling", twd.Status.TargetVersion.BuildID))
+		r.setCondition(twd, temporaliov1alpha1.ConditionReconciling,
+			metav1.ConditionTrue, temporaliov1alpha1.ReasonWaitingForPollers,
+			fmt.Sprintf("Waiting for workers with buildID %s to start polling", twd.Status.TargetVersion.BuildID))
 	}
 }
 
+// stalledReasons are the blocking reasons reported through the kstatus Stalled
+// condition, which makes kstatus report Failed and lets Argo Rollouts and Helm --wait
+// fail fast instead of waiting out their timeout. Reasons absent from this set are
+// treated as transient: the controller keeps retrying and kstatus keeps reporting
+// InProgress, exactly as it did before this condition existed.
+//
+// A reason belongs here only when it is decidable from information already in hand.
+// Both entries below are settled by the spec the user just applied plus how the
+// controller was deployed; nothing arriving later can change the answer, so calling
+// them terminal can never be wrong.
+//
+// Everything else is deliberately excluded, in two groups:
+//
+//   - Waiting on another object to exist — ReasonConnectionNotFound (a Connection) and
+//     ReasonAuthSecretInvalid (a Secret, which this reason also covers when simply
+//     absent). Applying a WorkerDeployment alongside its Connection and credentials in
+//     one release gives no ordering guarantee, so a missing reference can be a normal
+//     few-second gap rather than a mistake. Reporting Failed there would abort a deploy
+//     that was about to succeed, and a false failure costs more than a slow one.
+//     Distinguishing a real typo would need a grace period — report Stalled only once
+//     the reference has been missing for a while — which lastTransitionTime already
+//     makes measurable. Until then these keep pre-existing behaviour.
+//
+//   - Transient infrastructure failures — ReasonTemporalClientCreationFailed and
+//     ReasonTemporalStateFetchFailed (server unreachable or rate limited; the
+//     ResourceExhausted paths requeue after 30s) and ReasonPlanGenerationFailed /
+//     ReasonPlanExecutionFailed (retried with backoff). Marking these Stalled would
+//     abort a deploy that is merely being throttled.
+//
+// WorkerResourceTemplate makes the same call for the same reason: a WRT whose
+// WorkerDeployment does not exist yet reports Reconciling, not Stalled. See
+// markWRTsWDNotFound.
+var stalledReasons = map[string]bool{
+	temporaliov1alpha1.ReasonInvalidSpec:                  true,
+	temporaliov1alpha1.ReasonClusterConnectionUnsupported: true,
+}
+
+// pendingTargetGroups returns the spec's groups that the target version does not have
+// available yet, or nil when the target is healthy or has no groups.
+func pendingTargetGroups(twd *temporaliov1alpha1.WorkerDeployment) []string {
+	if !twd.Spec.HasWorkerGroups() || twd.Status.TargetVersion.HealthySince != nil {
+		return nil
+	}
+	available := make(map[string]bool, len(twd.Status.TargetVersion.WorkerGroups))
+	for _, group := range twd.Status.TargetVersion.WorkerGroups {
+		available[group.Name] = group.HealthySince != nil
+	}
+	var pending []string
+	for _, group := range twd.Spec.WorkerGroupNames() {
+		if !available[group] {
+			pending = append(pending, group)
+		}
+	}
+	return pending
+}
+
 // recordWarningAndSetBlocked emits a warning event, sets Progressing=False and Ready=False
-// with the given reason, and persists the status immediately. Called on all error paths that
-// block reconciliation progress.
+// with the given reason, sets Stalled=True for reasons in stalledReasons, advances
+// status.observedGeneration, and persists the status immediately. Called on all error paths
+// that block reconciliation progress.
 func (r *WorkerDeploymentReconciler) recordWarningAndSetBlocked(
 	ctx context.Context,
 	workerDeploy *temporaliov1alpha1.WorkerDeployment,
@@ -848,6 +936,35 @@ func (r *WorkerDeploymentReconciler) recordWarningAndSetBlocked(
 	r.Recorder.Eventf(workerDeploy, corev1.EventTypeWarning, reason, "%s", eventMessage)
 	r.setCondition(workerDeploy, temporaliov1alpha1.ConditionProgressing, metav1.ConditionFalse, reason, conditionMessage)
 	r.setCondition(workerDeploy, temporaliov1alpha1.ConditionReady, metav1.ConditionFalse, reason, conditionMessage)
+
+	// Report terminal failures through the kstatus Stalled condition so consumers
+	// (Argo Rollouts, Helm --wait) fail fast instead of waiting out their timeout.
+	// Progressing=False alone cannot express this: kstatus does not read it.
+	//
+	// Both are always written, and exactly one of them is True. kstatus scans
+	// status.conditions in array order and returns on the first match, so an object
+	// carrying both as True would get a verdict that depends on which was inserted
+	// first. Writing the other as False rather than removing it keeps every condition
+	// this controller owns present on every object, whatever path produced it.
+	if stalledReasons[reason] {
+		r.setCondition(workerDeploy, temporaliov1alpha1.ConditionStalled, metav1.ConditionTrue, reason, conditionMessage)
+		r.setCondition(workerDeploy, temporaliov1alpha1.ConditionReconciling, metav1.ConditionFalse, reason, conditionMessage)
+	} else {
+		// Transient failure: the controller is still retrying (with backoff, or an
+		// explicit RequeueAfter for rate limits), so say so directly instead of
+		// leaving kstatus to infer it from the Ready=False fallback.
+		r.setCondition(workerDeploy, temporaliov1alpha1.ConditionStalled, metav1.ConditionFalse, reason, conditionMessage)
+		r.setCondition(workerDeploy, temporaliov1alpha1.ConditionReconciling, metav1.ConditionTrue, reason, conditionMessage)
+	}
+
+	// Record that this generation was observed even though it could not be
+	// reconciled: the controller has seen this spec and reached a verdict on it.
+	// Without this, status.observedGeneration lags metadata.generation on every
+	// error path that returns before generateStatus, and kstatus returns
+	// InProgress from its generation check before it ever reads the conditions
+	// set above.
+	workerDeploy.Status.ObservedGeneration = workerDeploy.Generation
+
 	// Deprecated: set ConnectionHealthy=False for v1.3.x compat, but only for
 	// reasons that actually indicate connection/auth issues. Plan generation and execution
 	// failures are unrelated to connection health and should not trigger this condition.

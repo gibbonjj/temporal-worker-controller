@@ -120,6 +120,57 @@ func TestAutoInjectFields_ScaleTargetRef(t *testing.T) {
 	})
 }
 
+func TestAutoInjectFields_TargetRef(t *testing.T) {
+	selectorLabels := map[string]string{
+		BuildIDLabel:              "abc123",
+		WorkerDeploymentNameLabel: "my-worker",
+	}
+
+	t.Run("does not inject targetRef when key is entirely absent", func(t *testing.T) {
+		spec := map[string]interface{}{
+			"updatePolicy": map[string]interface{}{"updateMode": "Initial"},
+		}
+		autoInjectFields(spec, "my-worker-abc123", "my-worker", "abc123", "my-temporal-ns", selectorLabels, nil)
+		_, hasKey := spec["targetRef"]
+		assert.False(t, hasKey, "targetRef should not be injected when absent (user must opt in with {})")
+	})
+
+	t.Run("injects targetRef when empty object (opt-in sentinel)", func(t *testing.T) {
+		spec := map[string]interface{}{
+			"targetRef": map[string]interface{}{},
+		}
+		autoInjectFields(spec, "my-worker-abc123", "my-worker", "abc123", "my-temporal-ns", selectorLabels, nil)
+		ref, ok := spec["targetRef"].(map[string]interface{})
+		require.True(t, ok)
+		assert.Equal(t, "my-worker-abc123", ref["name"])
+		assert.Equal(t, "Deployment", ref["kind"])
+		assert.Equal(t, appsv1.SchemeGroupVersion.String(), ref["apiVersion"])
+	})
+
+	t.Run("does not overwrite existing targetRef", func(t *testing.T) {
+		spec := map[string]interface{}{
+			"targetRef": map[string]interface{}{
+				"name": "custom-deployment",
+				"kind": "Deployment",
+			},
+		}
+		autoInjectFields(spec, "my-worker-abc123", "my-worker", "abc123", "my-temporal-ns", selectorLabels, nil)
+		ref := spec["targetRef"].(map[string]interface{})
+		assert.Equal(t, "custom-deployment", ref["name"], "should not overwrite user-provided ref")
+	})
+
+	t.Run("does not inject a targetRef nested below spec", func(t *testing.T) {
+		spec := map[string]interface{}{
+			"policy": map[string]interface{}{
+				"targetRef": map[string]interface{}{},
+			},
+		}
+		autoInjectFields(spec, "my-worker-abc123", "my-worker", "abc123", "my-temporal-ns", selectorLabels, nil)
+		nested := spec["policy"].(map[string]interface{})
+		assert.Empty(t, nested["targetRef"], "targetRef is injected only at spec.targetRef")
+	})
+}
+
 func TestAutoInjectFields_MatchLabels(t *testing.T) {
 	selectorLabels := map[string]string{
 		BuildIDLabel:              "abc123",
@@ -549,6 +600,159 @@ func TestRenderWorkerResourceTemplate_StripsTemporalMetricLabelPrefix(t *testing
 	assert.NotContains(t, ml, "temporal_namespace")
 }
 
+func TestRenderWorkerResourceTemplate_MetricTemplateVars(t *testing.T) {
+	const buildID = "abc123"
+	query := `max(temporal_slot_utilization{temporal_worker_deployment_name="{{temporal_worker_deployment_name}}",temporal_worker_build_id="{{temporal_worker_build_id}}",temporal_namespace="{{temporal_namespace}}"})`
+	raw := map[string]interface{}{
+		"apiVersion": "keda.sh/v1alpha1",
+		"kind":       "ScaledObject",
+		"metadata": map[string]interface{}{
+			"annotations": map[string]interface{}{
+				"example.com/build": "{{temporal_worker_build_id}}",
+			},
+		},
+		"spec": map[string]interface{}{
+			"scaleTargetRef":  map[string]interface{}{},
+			"minReplicaCount": float64(1),
+			"triggers": []interface{}{
+				map[string]interface{}{
+					"type": "temporal",
+					"metadata": map[string]interface{}{
+						"taskQueue":               "my-tq",
+						"workerDeploymentName":    "",
+						"workerDeploymentBuildId": "",
+						"namespace":               "",
+					},
+				},
+				map[string]interface{}{
+					"type": "prometheus",
+					"metadata": map[string]interface{}{
+						"serverAddress": "http://prometheus:9090",
+						"query":         query,
+						"threshold":     "0.7",
+					},
+				},
+			},
+		},
+	}
+	rawBytes, err := json.Marshal(raw)
+	require.NoError(t, err)
+
+	wrt := &temporaliov1alpha1.WorkerResourceTemplate{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "my-scaledobject",
+			Namespace: "default",
+			UID:       types.UID("wrt-uid-789"),
+		},
+		Spec: temporaliov1alpha1.WorkerResourceTemplateSpec{
+			WorkerDeploymentRef: &temporaliov1alpha1.WorkerDeploymentReference{Name: "my-worker"},
+			Template:            runtime.RawExtension{Raw: rawBytes},
+		},
+	}
+	deployment := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-worker-abc123", Namespace: "default"},
+	}
+
+	obj, err := RenderWorkerResourceTemplate(wrt, deployment, buildID, "my-temporal-ns", false)
+	require.NoError(t, err)
+
+	annotations := obj.GetAnnotations()
+	assert.Equal(t, buildID, annotations["example.com/build"])
+
+	spec := obj.Object["spec"].(map[string]interface{})
+	assert.Equal(t, float64(1), spec["minReplicaCount"])
+	triggers := spec["triggers"].([]interface{})
+
+	temporalMD := triggers[0].(map[string]interface{})["metadata"].(map[string]interface{})
+	assert.Equal(t, "default/my-worker", temporalMD["workerDeploymentName"])
+	assert.Equal(t, buildID, temporalMD["workerDeploymentBuildId"])
+	assert.Equal(t, "my-temporal-ns", temporalMD["namespace"])
+	assert.Equal(t, "my-tq", temporalMD["taskQueue"])
+
+	promMD := triggers[1].(map[string]interface{})["metadata"].(map[string]interface{})
+	assert.Equal(t, `max(temporal_slot_utilization{temporal_worker_deployment_name="default_my-worker",temporal_worker_build_id="abc123",temporal_namespace="my-temporal-ns"})`, promMD["query"])
+	assert.Equal(t, "0.7", promMD["threshold"])
+	assert.Equal(t, "http://prometheus:9090", promMD["serverAddress"])
+}
+
+func TestRenderWorkerResourceTemplate_MetricTemplateVarsStripPrefix(t *testing.T) {
+	const buildID = "abc123"
+	query := `max(temporal_slot_utilization{worker_deployment_name="{{worker_deployment_name}}",worker_build_id="{{worker_build_id}}",namespace="{{namespace}}",temporal_namespace="{{temporal_namespace}}"})`
+	raw := map[string]interface{}{
+		"apiVersion": "keda.sh/v1alpha1",
+		"kind":       "ScaledObject",
+		"spec": map[string]interface{}{
+			"scaleTargetRef": map[string]interface{}{},
+			"triggers": []interface{}{
+				map[string]interface{}{
+					"type": "prometheus",
+					"metadata": map[string]interface{}{
+						"query": query,
+					},
+				},
+			},
+		},
+	}
+	rawBytes, err := json.Marshal(raw)
+	require.NoError(t, err)
+
+	wrt := &temporaliov1alpha1.WorkerResourceTemplate{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "my-scaledobject",
+			Namespace: "default",
+			UID:       types.UID("wrt-uid-789"),
+		},
+		Spec: temporaliov1alpha1.WorkerResourceTemplateSpec{
+			WorkerDeploymentRef: &temporaliov1alpha1.WorkerDeploymentReference{Name: "my-worker"},
+			Template:            runtime.RawExtension{Raw: rawBytes},
+		},
+	}
+	deployment := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-worker-abc123", Namespace: "default"},
+	}
+
+	obj, err := RenderWorkerResourceTemplate(wrt, deployment, buildID, "my-temporal-ns", true)
+	require.NoError(t, err)
+
+	promMD := obj.Object["spec"].(map[string]interface{})["triggers"].([]interface{})[0].(map[string]interface{})["metadata"].(map[string]interface{})
+	assert.Equal(t, `max(temporal_slot_utilization{worker_deployment_name="default_my-worker",worker_build_id="abc123",namespace="my-temporal-ns",temporal_namespace="{{temporal_namespace}}"})`, promMD["query"])
+}
+
+func TestSubstituteMetricTemplateVars(t *testing.T) {
+	vars := map[string]string{
+		"temporal_worker_deployment_name": "default_my-worker",
+		"temporal_worker_build_id":        "abc123",
+		"temporal_namespace":              "my-ns",
+	}
+
+	t.Run("replaces only the exact token", func(t *testing.T) {
+		obj := map[string]interface{}{
+			"query": "{{temporal_worker_build_id}}-{{temporal_worker_build_id}}-{{ temporal_worker_build_id }}-{{nope}}",
+		}
+		substituteMetricTemplateVars(obj, vars)
+		assert.Equal(t, "abc123-abc123-{{ temporal_worker_build_id }}-{{nope}}", obj["query"])
+	})
+
+	t.Run("leaves strings without tokens unchanged", func(t *testing.T) {
+		obj := map[string]interface{}{
+			"nested": []interface{}{"plain", map[string]interface{}{"k": "still-plain"}},
+		}
+		substituteMetricTemplateVars(obj, vars)
+		assert.Equal(t, "plain", obj["nested"].([]interface{})[0])
+		assert.Equal(t, "still-plain", obj["nested"].([]interface{})[1].(map[string]interface{})["k"])
+	})
+
+	t.Run("does not rewrite non-strings or map keys", func(t *testing.T) {
+		obj := map[string]interface{}{
+			"{{temporal_worker_build_id}}": float64(1),
+			"flag":                         true,
+		}
+		substituteMetricTemplateVars(obj, vars)
+		assert.Equal(t, float64(1), obj["{{temporal_worker_build_id}}"])
+		assert.True(t, obj["flag"].(bool))
+	})
+}
+
 func TestHasScaleTarget(t *testing.T) {
 	t.Run("detects the sentinel in a KEDA ScaledObject", func(t *testing.T) {
 		raw := []byte(`{
@@ -627,6 +831,19 @@ func TestHasScaleTarget(t *testing.T) {
 			"spec": {
 				"minAvailable": 1,
 				"selector": {"matchLabels": {}}
+			}
+		}`)
+		assert.False(t, HasScaleTarget(raw))
+	})
+
+	// A VPA does not drive replica count, so it is kept until the versioned Deployment is deleted.
+	t.Run("returns false for a VerticalPodAutoscaler", func(t *testing.T) {
+		raw := []byte(`{
+			"apiVersion": "autoscaling.k8s.io/v1",
+			"kind": "VerticalPodAutoscaler",
+			"spec": {
+				"targetRef": {},
+				"updatePolicy": {"updateMode": "Initial"}
 			}
 		}`)
 		assert.False(t, HasScaleTarget(raw))

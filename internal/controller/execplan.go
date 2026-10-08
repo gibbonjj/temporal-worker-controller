@@ -28,6 +28,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	autoscalingv1 "k8s.io/api/autoscaling/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -46,19 +47,19 @@ import (
 // the next reconcile. Rendered-resource delete failures are logged rather than returned as
 // errors, so the returned slice can be partial even when the error is nil.
 func (r *WorkerDeploymentReconciler) executeK8sOperations(ctx context.Context, l logr.Logger, workerDeploy *temporaliov1alpha1.WorkerDeployment, p *plan) ([]planner.WorkerResourceRef, error) {
-	// Create deployment
-	if p.CreateDeployment != nil {
-		l.Info("creating deployment", "deployment", p.CreateDeployment.Name)
-		if err := r.Create(ctx, p.CreateDeployment); err != nil {
-			l.Error(err, "unable to create deployment", "deployment", p.CreateDeployment.Name)
+	// Create deployments
+	for _, d := range p.CreateDeployments {
+		l.Info("creating deployment", "deployment", d.Name)
+		if err := r.Create(ctx, d); err != nil {
+			l.Error(err, "unable to create deployment", "deployment", d.Name)
 			r.Recorder.Eventf(workerDeploy, corev1.EventTypeWarning, ReasonDeploymentCreateFailed,
-				"Failed to create Deployment %q: %v", p.CreateDeployment.Name, err)
+				"Failed to create Deployment %q: %v", d.Name, err)
 			return nil, err
 		}
 	}
 
 	// Delete deployments
-	for _, d := range p.DeleteDeployments {
+	for _, d := range slices.Concat(p.DeleteDeployments, p.DeleteWorkerGroupDeployments) {
 		l.Info("deleting deployment", "deployment", d.Name)
 		if err := r.Delete(ctx, d); err != nil {
 			l.Error(err, "unable to delete deployment", "deployment", d.Name)
@@ -132,7 +133,7 @@ func (r *WorkerDeploymentReconciler) executeK8sOperations(ctx context.Context, l
 	// Update deployments
 	for _, d := range p.UpdateDeployments {
 		// No point in updating a deleted Deployment...
-		if containsDeployment(d, p.DeleteDeployments) {
+		if containsDeployment(d, p.DeleteDeployments) || containsDeployment(d, p.DeleteWorkerGroupDeployments) {
 			continue
 		}
 		l.Info("updating deployment", "deployment", d.Name, "namespace", d.Namespace)
@@ -155,14 +156,26 @@ func buildIDForDeployment(workerDeploy *temporaliov1alpha1.WorkerDeployment, dep
 			versionDeployment.Name == deployment.Name
 	}
 
-	if matches(workerDeploy.Status.TargetVersion.Deployment) {
+	matchesVersion := func(v temporaliov1alpha1.BaseWorkerDeploymentVersion) bool {
+		if matches(v.Deployment) {
+			return true
+		}
+		for _, group := range v.WorkerGroups {
+			if matches(group.Deployment) {
+				return true
+			}
+		}
+		return false
+	}
+
+	if matchesVersion(workerDeploy.Status.TargetVersion.BaseWorkerDeploymentVersion) {
 		return workerDeploy.Status.TargetVersion.BuildID
 	}
-	if workerDeploy.Status.CurrentVersion != nil && matches(workerDeploy.Status.CurrentVersion.Deployment) {
+	if workerDeploy.Status.CurrentVersion != nil && matchesVersion(workerDeploy.Status.CurrentVersion.BaseWorkerDeploymentVersion) {
 		return workerDeploy.Status.CurrentVersion.BuildID
 	}
 	for _, version := range workerDeploy.Status.DeprecatedVersions {
-		if version != nil && matches(version.Deployment) {
+		if version != nil && matchesVersion(version.BaseWorkerDeploymentVersion) {
 			return version.BuildID
 		}
 	}
@@ -461,6 +474,10 @@ func (r *WorkerDeploymentReconciler) executeWRTOperations(
 		hash         string // rendered hash recorded on successful apply; "" on error
 		err          error
 		skipped      bool // true if the apply was skipped because the rendered hash is unchanged
+		// renderFailed distinguishes a spec.template render failure from an SSA apply
+		// failure. Render failures are always terminal as only a spec change can fix
+		// them while apply failures are classified by API error kind.
+		renderFailed bool
 	}
 	wrtResults := make(map[wrtKey][]applyResult)
 
@@ -474,8 +491,9 @@ func (r *WorkerDeploymentReconciler) executeWRTOperations(
 				"buildID", apply.BuildID,
 			)
 			wrtResults[key] = append(wrtResults[key], applyResult{
-				buildID: apply.BuildID,
-				err:     apply.RenderError,
+				buildID:      apply.BuildID,
+				err:          apply.RenderError,
+				renderFailed: true,
 			})
 			continue
 		}
@@ -566,11 +584,32 @@ func (r *WorkerDeploymentReconciler) executeWRTOperations(
 	for key := range deletedBuildIDs {
 		statusKeys[key] = struct{}{}
 	}
+	// WRTs with a missing or recovered group get no applies, so nothing else rewrites their Ready condition.
+	missingGroup := make(map[wrtKey]bool, len(p.WRTsWithMissingWorkerGroup))
+	for _, name := range p.WRTsWithMissingWorkerGroup {
+		key := wrtKey{workerDeploy.Namespace, name}
+		missingGroup[key] = true
+		statusKeys[key] = struct{}{}
+	}
+	staleGroup := make(map[wrtKey]bool, len(p.WRTsWithStaleWorkerGroupNotFound))
+	for _, name := range p.WRTsWithStaleWorkerGroupNotFound {
+		key := wrtKey{workerDeploy.Namespace, name}
+		staleGroup[key] = true
+		statusKeys[key] = struct{}{}
+	}
 
 	var applyErrs, statusErrs []error
 	for key := range statusKeys {
 		results := wrtResults[key]
 		deleted := deletedBuildIDs[key]
+
+		wrt := &temporaliov1alpha1.WorkerResourceTemplate{}
+		if err := r.Get(ctx, types.NamespacedName{Namespace: key.namespace, Name: key.name}, wrt); err != nil {
+			if client.IgnoreNotFound(err) != nil {
+				statusErrs = append(statusErrs, fmt.Errorf("get WRT %s/%s for status update: %w", key.namespace, key.name, err))
+			}
+			continue
+		}
 
 		allSkipped := true
 		for _, res := range results {
@@ -579,13 +618,30 @@ func (r *WorkerDeploymentReconciler) executeWRTOperations(
 				break
 			}
 		}
-		if allSkipped && len(deleted) == 0 {
-			continue
-		}
-
-		wrt := &temporaliov1alpha1.WorkerResourceTemplate{}
-		if err := r.Get(ctx, types.NamespacedName{Namespace: key.namespace, Name: key.name}, wrt); err != nil {
-			statusErrs = append(statusErrs, fmt.Errorf("get WRT %s/%s for status update: %w", key.namespace, key.name, err))
+		onlyGroupCheck := allSkipped && len(deleted) == 0
+		if onlyGroupCheck && !missingGroup[key] && !staleGroup[key] {
+			// Every apply was a no-op and nothing was deleted, so the per-Build-ID
+			// status and conditions are already correct. The one thing that can still
+			// be stale is status.observedGeneration.
+			//
+			// metadata.generation tracks any semantic change to the spec, while the
+			// skip decision above is made on a hash of the rendered output. Those two
+			// can come apart. Switching spec.temporalWorkerDeploymentRef to
+			// spec.workerDeploymentRef with the same name is such a case: the webhook
+			// permits it (only the effective name is immutable) and it is step 4 of the
+			// CRD rename migration, but rendering does not depend on which ref field
+			// was used, so the hash is unchanged, every apply is skipped and no status
+			// write happens. A stale observedGeneration would make kstatus report
+			// InProgress forever.
+			//
+			// The WRT was already fetched from the informer cache above, and the write
+			// only happens when something has actually changed.
+			if wrt.Status.ObservedGeneration != wrt.Generation {
+				wrt.Status.ObservedGeneration = wrt.Generation
+				if err := r.Status().Update(ctx, wrt); err != nil {
+					statusErrs = append(statusErrs, fmt.Errorf("refresh observedGeneration for WRT %s/%s: %w", key.namespace, key.name, err))
+				}
+			}
 			continue
 		}
 
@@ -601,6 +657,7 @@ func (r *WorkerDeploymentReconciler) executeWRTOperations(
 		versions := make([]temporaliov1alpha1.WorkerResourceTemplateVersionStatus, 0, len(results))
 		coveredByApply := make(map[string]struct{}, len(results))
 		anyFailed := false
+		anyTerminal := false
 		for _, result := range results {
 			coveredByApply[result.buildID] = struct{}{}
 			if result.skipped {
@@ -615,6 +672,9 @@ func (r *WorkerDeploymentReconciler) executeWRTOperations(
 				applyErrs = append(applyErrs, result.err)
 				applyErr = result.err.Error()
 				anyFailed = true
+				if isTerminalWorkerResourceError(result.err, result.renderFailed) {
+					anyTerminal = true
+				}
 				// 0 means "unset" / "not yet successfully applied at current generation".
 				// Failure Message and LastTransitionTime are still recorded below.
 				appliedGeneration = 0
@@ -643,11 +703,19 @@ func (r *WorkerDeploymentReconciler) executeWRTOperations(
 		// Compute the top-level Ready condition.
 		// True:  all active Build IDs applied at the current generation (or already current —
 		//        skipped ones carry a non-zero LastAppliedGeneration from their last successful apply).
-		// False: one or more apply calls failed this cycle.
+		// False: one or more apply calls failed this cycle, or the WRT's group is missing.
 		condStatus := metav1.ConditionTrue
 		condReason := temporaliov1alpha1.ReasonWRTAllVersionsApplied
 		condMessage := ""
-		if anyFailed {
+		switch {
+		case missingGroup[key]:
+			condStatus = metav1.ConditionFalse
+			condReason = temporaliov1alpha1.ReasonWRTWorkerGroupNotFound
+			condMessage = fmt.Sprintf("WorkerDeployment %q has no group %q", workerDeploy.Name, wrt.Spec.WorkerGroup)
+			if wrt.Spec.WorkerGroup == "" {
+				condMessage = fmt.Sprintf("WorkerDeployment %q uses worker groups; set spec.workerGroup", workerDeploy.Name)
+			}
+		case anyFailed:
 			condStatus = metav1.ConditionFalse
 			condReason = temporaliov1alpha1.ReasonWRTApplyFailed
 			// Use the first apply error as the condition message; full per-version details
@@ -659,13 +727,68 @@ func (r *WorkerDeploymentReconciler) executeWRTOperations(
 				}
 			}
 		}
-		apimeta.SetStatusCondition(&wrt.Status.Conditions, metav1.Condition{
-			Type:               temporaliov1alpha1.ConditionReady,
-			Status:             condStatus,
+		var condChanged bool
+		if staleGroup[key] && len(results) == 0 {
+			condChanged = apimeta.RemoveStatusCondition(&wrt.Status.Conditions, temporaliov1alpha1.ConditionReady)
+		} else {
+			condChanged = apimeta.SetStatusCondition(&wrt.Status.Conditions, metav1.Condition{
+				Type:               temporaliov1alpha1.ConditionReady,
+				Status:             condStatus,
+				Reason:             condReason,
+				Message:            condMessage,
+				ObservedGeneration: wrt.Generation,
+			})
+		}
+
+		// Translate the same outcome into the kstatus abnormal-true conditions, so
+		// Argo Rollouts and Helm --wait can tell a template that will never apply from
+		// one that is still being retried. Ready=False alone reads as InProgress to
+		// kstatus, which is why a bad template used to hang a deploy until timeout.
+		//
+		// Both are always written, and at most one of them is True. kstatus scans
+		// status.conditions in array order and returns on the first match, so an object
+		// carrying both as True would get a verdict decided by insertion order.
+		// Writing the inactive one as False rather than removing it keeps every
+		// condition this controller owns present on every object.
+		//
+		// A missing group is Reconciling, not Stalled, for the same reason a missing
+		// WorkerDeployment is: the group may be added to the WorkerDeployment later.
+		stalledStatus, reconcilingStatus := metav1.ConditionFalse, metav1.ConditionFalse
+		switch {
+		case anyTerminal:
+			stalledStatus = metav1.ConditionTrue
+		case anyFailed, missingGroup[key]:
+			reconcilingStatus = metav1.ConditionTrue
+		}
+		if apimeta.SetStatusCondition(&wrt.Status.Conditions, metav1.Condition{
+			Type:               temporaliov1alpha1.ConditionStalled,
+			Status:             stalledStatus,
 			Reason:             condReason,
 			Message:            condMessage,
 			ObservedGeneration: wrt.Generation,
-		})
+		}) {
+			condChanged = true
+		}
+		if apimeta.SetStatusCondition(&wrt.Status.Conditions, metav1.Condition{
+			Type:               temporaliov1alpha1.ConditionReconciling,
+			Status:             reconcilingStatus,
+			Reason:             condReason,
+			Message:            condMessage,
+			ObservedGeneration: wrt.Generation,
+		}) {
+			condChanged = true
+		}
+
+		// Record that this generation was processed, whatever the outcome. kstatus
+		// checks this before it looks at any condition, so leaving it behind would
+		// mask both of the conditions set above.
+		if wrt.Status.ObservedGeneration != wrt.Generation {
+			wrt.Status.ObservedGeneration = wrt.Generation
+			condChanged = true
+		}
+		if onlyGroupCheck && !condChanged {
+			continue
+		}
 
 		// Sort the versions by BuildID for deterministic status output.
 		slices.SortFunc(versions, func(a, b temporaliov1alpha1.WorkerResourceTemplateVersionStatus) int {
@@ -678,6 +801,35 @@ func (r *WorkerDeploymentReconciler) executeWRTOperations(
 	}
 
 	return errors.Join(append(applyErrs, statusErrs...)...)
+}
+
+// isTerminalWorkerResourceError reports whether a WorkerResourceTemplate failure can
+// only be resolved by a human changing something, and so should be surfaced through the
+// kstatus Stalled condition (making kstatus report Failed) rather than left looking
+// like work still in progress.
+//
+// renderFailed covers a spec.template that could not be rendered at all. This is always
+// terminal, since only a spec change can fix it. For SSA apply failures only the API
+// server's own outright rejections count: Invalid (the rendered object does not satisfy
+// the target schema), Forbidden and Unauthorized (the controller lacks RBAC for the
+// templated kind), BadRequest, and the media-type/method rejections.
+//
+// Everything else (Conflict, timeouts, TooManyRequests, transport errors) is retried
+// on the next reconcile and deliberately keeps reporting InProgress, so a blip cannot
+// abort a deploy. This mirrors the stalledReasons split in worker_controller.go.
+func isTerminalWorkerResourceError(err error, renderFailed bool) bool {
+	if err == nil {
+		return false
+	}
+	if renderFailed {
+		return true
+	}
+	return apierrors.IsInvalid(err) ||
+		apierrors.IsForbidden(err) ||
+		apierrors.IsUnauthorized(err) ||
+		apierrors.IsBadRequest(err) ||
+		apierrors.IsUnsupportedMediaType(err) ||
+		apierrors.IsMethodNotSupported(err)
 }
 
 // deleteDeprecatedVersions prunes the Temporal server-side Worker Deployment Version
@@ -721,7 +873,9 @@ func (r *WorkerDeploymentReconciler) deleteDeprecatedVersions(
 	p *plan,
 ) {
 	identity := getControllerIdentity()
-	markedForDeletion := make([]*appsv1.Deployment, 0, len(p.DeleteDeployments))
+	// A version's group Deployments are pruned together, after one DeleteVersion call.
+	var buildIDs []string
+	deploymentsByBuildID := make(map[string][]*appsv1.Deployment)
 	for _, d := range p.DeleteDeployments {
 		buildID, ok := d.GetLabels()[k8s.BuildIDLabel]
 		if !ok {
@@ -732,8 +886,17 @@ func (r *WorkerDeploymentReconciler) deleteDeprecatedVersions(
 			l.Info("deployment has no build ID label, leaving the k8s Deployment alone", "deployment", d.Name)
 			continue
 		}
+		if _, seen := deploymentsByBuildID[buildID]; !seen {
+			buildIDs = append(buildIDs, buildID)
+		}
+		deploymentsByBuildID[buildID] = append(deploymentsByBuildID[buildID], d)
+	}
+
+	markedForDeletion := make([]*appsv1.Deployment, 0, len(p.DeleteDeployments))
+	for _, buildID := range buildIDs {
+		deployments := deploymentsByBuildID[buildID]
 		if isVersionNotRegistered(workerDeploy, buildID) {
-			markedForDeletion = append(markedForDeletion, d)
+			markedForDeletion = append(markedForDeletion, deployments...)
 			continue
 		}
 		backoffKey := k8s.ComputeWorkerDeploymentName(workerDeploy) + "/" + buildID
@@ -763,8 +926,8 @@ func (r *WorkerDeploymentReconciler) deleteDeprecatedVersions(
 		if err != nil {
 			var notFound *serviceerror.NotFound
 			if !errors.As(err, &notFound) {
-				l.Info("could not delete worker deployment version, keeping its k8s Deployment to reconcile",
-					"buildID", buildID, "deployment", d.Name, "error", err)
+				l.Info("could not delete worker deployment version, keeping its k8s Deployments to reconcile",
+					"buildID", buildID, "error", err)
 				r.noteVersionDeleteFailure(backoffKey)
 				continue
 			}
@@ -773,7 +936,7 @@ func (r *WorkerDeploymentReconciler) deleteDeprecatedVersions(
 			l.Info("deleted deprecated worker deployment version", "buildID", buildID)
 		}
 		r.noteVersionDeleteSuccess(backoffKey)
-		markedForDeletion = append(markedForDeletion, d)
+		markedForDeletion = append(markedForDeletion, deployments...)
 	}
 	p.DeleteDeployments = markedForDeletion
 }
