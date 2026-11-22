@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 	"github.com/temporalio/temporal-worker-controller/internal/controller/clientpool"
 	"github.com/temporalio/temporal-worker-controller/internal/k8s"
 	"github.com/temporalio/temporal-worker-controller/internal/temporal"
+	"github.com/temporalio/temporal-worker-controller/pkg/controller/config"
 	"go.temporal.io/api/serviceerror"
 	sdkclient "go.temporal.io/sdk/client"
 	"google.golang.org/grpc/codes"
@@ -51,10 +53,12 @@ const (
 	// wrtWorkerRefKey is the field index key for WorkerResourceTemplate by effective workerDeploymentRef name.
 	wrtWorkerRefKey = ".spec.workerDeploymentRef.name"
 
-	// finalizerName is the finalizer added to deprecated TemporalWorkerDeployment and TemporalConnection
-	// resources to prevent deletion before cleanup actions are taken. On TWD resources, it
-	// ensures Temporal server-side versioning data is cleaned up. On TemporalConnection
-	// resources, it prevents deletion while any TWD still references the connection.
+	// finalizerName is the finalizer added to WorkerDeployment and Connection/ClusterConnection
+	// resources to prevent deletion before cleanup actions are taken. On WorkerDeployment
+	// resources, it ensures Temporal server-side versioning data is cleaned up. On connection
+	// resources, it prevents deletion while any WorkerDeployment still references the connection.
+	// Pre-v1.7 controllers also placed it on TemporalWorkerDeployment and TemporalConnection;
+	// the deprecated reconcilers remove it from those once migration is confirmed.
 	finalizerName = "temporal.io/delete-protection"
 )
 
@@ -64,32 +68,7 @@ type WorkerDeploymentReconciler struct {
 	Scheme             *runtime.Scheme
 	TemporalClientPool *clientpool.ClientPool
 	Recorder           record.EventRecorder
-
-	// Disables panic recovery if true
-	DisableRecoverPanic  bool
-	DisableDeprecatedTWD bool
-
-	// DisableClusterConnections drops ClusterConnection support. Set when the manager is
-	// namespace-scoped: ClusterConnection is cluster-scoped, so a namespaced Role can never
-	// authorize listing it and the watch would retry forever against a 403.
-	DisableClusterConnections bool
-
-	// WRTHPAMatchLabelsStripTemporalPrefix removes the "temporal_" prefix from
-	// controller-managed external metric matchLabels in rendered WorkerResourceTemplates.
-	WRTHPAMatchLabelsStripTemporalPrefix bool
-
-	// When a Worker Deployment has the maximum number of versions (100 per Worker Deployment by default),
-	// it will delete the oldest eligible version when a worker with the 101st version arrives.
-	// If no versions are eligible for deletion, that worker's poll will fail, which is dangerous.
-	// To protect against this, when a Worker Deployment has too many versions ineligible for deletion,
-	// the controller will stop deploying new workers in order to give the user the opportunity to adjust
-	// their sunset policy to avoid this situation before it actually blocks deployment of a new worker
-	// version on the server side.
-	//
-	// MaxDeploymentVersionsIneligibleForDeletion is currently defaulted to 75, which is safe for the default
-	// server value of `matching.maxVersionsInDeployment=100`.
-	// Users who reduce `matching.maxVersionsInDeployment` in their dynamicconfig should also reduce this value.
-	MaxDeploymentVersionsIneligibleForDeletion int32
+	Config             config.Config
 
 	// deleteBackoff rate-limits repeated DeleteVersion failures per (worker deployment, build ID).
 	deleteBackoff     *flowcontrol.Backoff
@@ -110,6 +89,7 @@ type WorkerDeploymentReconciler struct {
 // +kubebuilder:rbac:groups=temporal.io,resources=workerdeployments/finalizers,verbs=update
 // +kubebuilder:rbac:groups=core,resources=namespaces,verbs=get
 // +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch
+// +kubebuilder:rbac:groups=core,resources=configmaps,verbs=get;list;watch
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=apps,resources=deployments/scale,verbs=update
 // +kubebuilder:rbac:groups=core,resources=events,verbs=create;patch
@@ -136,9 +116,9 @@ func (r *WorkerDeploymentReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	// Fallback identity check for when the reconciler is used as a library and
 	// main() is not in the call path. main() is kept as the primary check for
 	// faster feedback in normal Helm-based deployments.
-	if getControllerIdentity() == "" {
+	if config.GetControllerIdentity() == "" {
 		return ctrl.Result{}, errors.New(fmt.Sprintf("%s and %s are not set",
-			IdentityEnvKey, IdentitySuffixEnvKey))
+			config.IdentityEnvKey, config.IdentitySuffixEnvKey))
 	}
 
 	l.V(1).Info("Running Reconcile loop")
@@ -164,7 +144,7 @@ func (r *WorkerDeploymentReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	// Migration: if a deprecated TemporalWorkerDeployment with the same name/namespace
 	// exists and has not yet been migrated, transfer ownership of its child Deployments
 	// and WorkerResourceTemplates to this WorkerDeployment.
-	if !r.DisableDeprecatedTWD {
+	if !r.Config.DisableDeprecatedTWD {
 		if err := r.migrateFromDeprecatedTWD(ctx, l, &workerDeploy); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -206,9 +186,11 @@ func (r *WorkerDeploymentReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	// This WorkerDeployment can never reconcile. Reported before the finalizer is added so it
 	// stays deletable, and without requeueing since only a spec or deployment-mode change can
 	// resolve it.
-	if r.DisableClusterConnections && connectionRefIsCluster(workerDeploy.Spec.WorkerOptions.ConnectionRef) {
-		msg := fmt.Sprintf("ClusterConnection %q cannot be used because the controller is namespace-scoped",
-			connectionRefName(workerDeploy.Spec.WorkerOptions.ConnectionRef))
+	if r.Config.DisableClusterConnections && workerDeploy.Spec.WorkerOptions.ConnectionRef.IsCluster() {
+		msg := fmt.Sprintf(
+			"ClusterConnection %q cannot be used because the controller is namespace-scoped",
+			workerDeploy.Spec.WorkerOptions.ConnectionRef.ResolvedName(),
+		)
 		r.recordWarningAndSetBlocked(ctx, &workerDeploy,
 			temporaliov1alpha1.ReasonClusterConnectionUnsupported, msg, msg)
 		return ctrl.Result{}, nil
@@ -253,8 +235,17 @@ func (r *WorkerDeploymentReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		l.Error(err, "unable to fetch Connection")
 		r.recordWarningAndSetBlocked(ctx, &workerDeploy,
 			temporaliov1alpha1.ReasonConnectionNotFound,
-			fmt.Sprintf("Unable to fetch Connection %q: %v", workerDeploy.Spec.WorkerOptions.ConnectionRef.Name, err),
-			fmt.Sprintf("Connection %q not found: %v", workerDeploy.Spec.WorkerOptions.ConnectionRef.Name, err))
+			fmt.Sprintf(
+				"Unable to fetch Connection %q: %v",
+				workerDeploy.Spec.WorkerOptions.ConnectionRef.ResolvedName(),
+				err,
+			),
+			fmt.Sprintf(
+				"Connection %q not found: %v",
+				workerDeploy.Spec.WorkerOptions.ConnectionRef.ResolvedName(),
+				err,
+			),
+		)
 		return ctrl.Result{}, err
 	}
 
@@ -270,68 +261,52 @@ func (r *WorkerDeploymentReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	// finalizer from the previously-referenced connection if no other WD uses it.
 	// The new connection is already protected by ensureConnectionFinalizer above,
 	// so the WD is never left unprotected.
-	if workerDeploy.Generation != workerDeploy.Status.ObservedGeneration {
-		current := workerDeploy.Spec.WorkerOptions.ConnectionRef
-		if observed := workerDeploy.Status.ObservedConnectionRef; observed != nil && !sameConnectionRef(*observed, current) {
-			if err := r.releaseConnectionFinalizerIfUnused(ctx, l, *observed, workerDeploy.Namespace, workerDeploy.Name); err != nil {
-				return ctrl.Result{}, err
-			}
+	//
+	// This compares the observed ref directly rather than first gating on
+	// generation != observedGeneration. Blocked reconciles now advance
+	// observedGeneration (see recordWarningAndSetBlocked), so a connectionRef change
+	// whose first reconcile was blocked (by repointing at a Connection that does not
+	// exist yet for example) would otherwise never be noticed again and the old connection
+	// would keep the finalizer forever. ObservedConnectionRef is only written on a
+	// successful reconcile, so it remains the correct thing to compare against.
+	current := workerDeploy.Spec.WorkerOptions.ConnectionRef
+	observed := workerDeploy.Status.ObservedConnectionRef
+	if observed != nil && !observed.ResolvesTo(current) {
+		if err := r.releaseConnectionFinalizerIfUnused(ctx, l, *observed, workerDeploy.Namespace, workerDeploy.Name); err != nil {
+			return ctrl.Result{}, err
 		}
 	}
 
-	if err := connection.Spec.Validate(); err != nil {
-		l.Error(err, "connection spec not valid")
-		// TODO(jaypipes): As of TWC release <=v1.8.1, the only validation
-		// error for the connection spec is that the authentication secret is
-		// not valid. Revisit this warning reason when there are more potential
-		// validation failures.
-		r.recordWarningAndSetBlocked(ctx, &workerDeploy,
-			temporaliov1alpha1.ReasonAuthSecretInvalid,
-			fmt.Sprintf("Unable to resolve auth secret from Connection %q: %v", connObj.GetName(), err),
-			fmt.Sprintf("Unable to resolve auth secret: %v", err))
-		return ctrl.Result{}, err
-	}
-
-	// Get the Auth Mode and Secret Name
-	authMode := connection.Spec.AuthMode()
-	secretName := connection.Spec.SecretName()
-
-	// Get or update temporal client for connection
-	clientPoolKey := clientpool.ClientPoolKey{
-		HostPort:            connection.Spec.HostPort,
-		TLSServerName:       connection.Spec.TLSServerName(),
-		Namespace:           workerDeploy.Spec.WorkerOptions.TemporalNamespace,
-		SecretName:          secretName,
-		TLSCACertSecretName: connection.Spec.TLSCACertSecretName(),
-		AuthMode:            authMode,
-	}
-	temporalClient, ok := r.TemporalClientPool.GetSDKClient(clientPoolKey)
-	if !ok {
-		clientOpts, key, clientAuth, err := r.TemporalClientPool.ParseClientSecret(ctx, secretName, authMode, clientpool.NewClientOptions{
-			K8sNamespace:      workerDeploy.Namespace,
-			TemporalNamespace: workerDeploy.Spec.WorkerOptions.TemporalNamespace,
-			Spec:              connection.Spec,
-			Identity:          getControllerIdentity(),
-		})
-		if err != nil {
+	temporalClient, clientPoolKey, err := r.TemporalClientPool.GetClient(ctx,
+		connection.Spec,
+		workerDeploy.Spec.WorkerOptions.TemporalNamespace,
+		workerDeploy.Namespace,
+		config.GetControllerIdentity(),
+	)
+	if err != nil {
+		var authErr *clientpool.AuthConfigError
+		var dialErr *clientpool.DialError
+		switch {
+		case errors.As(err, &authErr):
 			l.Error(err, "invalid Temporal auth secret")
 			r.recordWarningAndSetBlocked(ctx, &workerDeploy,
 				temporaliov1alpha1.ReasonAuthSecretInvalid,
 				fmt.Sprintf("Invalid Temporal auth secret for %s:%s: %v", connection.Spec.HostPort, workerDeploy.Spec.WorkerOptions.TemporalNamespace, err),
 				fmt.Sprintf("Invalid auth secret: %v", err))
-			return ctrl.Result{}, err
-		}
-
-		c, err := r.TemporalClientPool.DialAndUpsertClient(*clientOpts, *key, *clientAuth)
-		if err != nil {
+		case errors.As(err, &dialErr):
 			l.Error(err, "unable to create TemporalClient")
 			r.recordWarningAndSetBlocked(ctx, &workerDeploy,
 				temporaliov1alpha1.ReasonTemporalClientCreationFailed,
 				fmt.Sprintf("Unable to create Temporal client for %s:%s: %v", connection.Spec.HostPort, workerDeploy.Spec.WorkerOptions.TemporalNamespace, err),
 				fmt.Sprintf("Failed to connect to Temporal: %v", err))
-			return ctrl.Result{}, err
+		default:
+			l.Error(err, "unable to create TemporalClient")
+			r.recordWarningAndSetBlocked(ctx, &workerDeploy,
+				temporaliov1alpha1.ReasonTemporalClientCreationFailed,
+				fmt.Sprintf("Unable to create Temporal client for %s:%s: %v", connection.Spec.HostPort, workerDeploy.Spec.WorkerOptions.TemporalNamespace, err),
+				fmt.Sprintf("Failed to connect to Temporal: %v", err))
 		}
-		temporalClient = c
+		return ctrl.Result{}, err
 	}
 
 	workerDeploymentName := k8s.ComputeWorkerDeploymentName(&workerDeploy)
@@ -356,10 +331,10 @@ func (r *WorkerDeploymentReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		temporalClient,
 		workerDeploymentName,
 		workerDeploy.Spec.WorkerOptions.TemporalNamespace,
-		k8sState.Deployments,
+		k8sState.BuildIDs(),
 		targetBuildID,
 		workerDeploy.Spec.RolloutStrategy.Strategy,
-		getControllerIdentity(),
+		config.GetControllerIdentity(),
 	)
 	if err != nil {
 		if shouldEvictClient(err) {
@@ -432,7 +407,7 @@ func (r *WorkerDeploymentReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	// target version has become current, this also factors in whether workers are
 	// actively polling Temporal into ConditionProgressing (Ready itself remains
 	// about rollout completion only).
-	r.syncConditions(&workerDeploy, temporalState)
+	r.syncConditions(&workerDeploy, temporalState, plan.BlockedReason)
 
 	// Single status write per reconcile: persists the generated status and
 	// conditions set during this loop (Ready, Progressing). Do not send the update
@@ -580,6 +555,24 @@ func (r *WorkerDeploymentReconciler) markWRTsWDNotFound(ctx context.Context, wd 
 			Message:            fmt.Sprintf("WorkerDeployment %q not found", wd.Name),
 			ObservedGeneration: wrt.Generation,
 		})
+		// Reconciling, not Stalled: a WRT that references a WorkerDeployment which does
+		// not exist yet is an expected, self-resolving state during creation ordering.
+		// Reporting Failed here would abort any install that applies the WRT before the WD.
+		meta.SetStatusCondition(&wrt.Status.Conditions, metav1.Condition{
+			Type:               temporaliov1alpha1.ConditionStalled,
+			Status:             metav1.ConditionFalse,
+			Reason:             temporaliov1alpha1.ReasonWRTWDNotFound,
+			Message:            fmt.Sprintf("WorkerDeployment %q not found", wd.Name),
+			ObservedGeneration: wrt.Generation,
+		})
+		meta.SetStatusCondition(&wrt.Status.Conditions, metav1.Condition{
+			Type:               temporaliov1alpha1.ConditionReconciling,
+			Status:             metav1.ConditionTrue,
+			Reason:             temporaliov1alpha1.ReasonWRTWDNotFound,
+			Message:            fmt.Sprintf("WorkerDeployment %q not found", wd.Name),
+			ObservedGeneration: wrt.Generation,
+		})
+		wrt.Status.ObservedGeneration = wrt.Generation
 		if err := r.Status().Update(ctx, wrt); err != nil {
 			l.Error(err, "unable to update WorkerResourceTemplate status for missing WorkerDeployment",
 				"WorkerResourceTemplate", wrt.Name, "WorkerDeployment", wd.Name)
@@ -613,42 +606,14 @@ func (r *WorkerDeploymentReconciler) handleDeletion(
 	}
 	connection := temporaliov1alpha1.Connection{Spec: connSpec}
 
-	if err := connection.Spec.Validate(); err != nil {
-		// TODO(jaypipes): As of TWC release <=v1.8.1, the only validation
-		// error for the connection spec is that the authentication secret is
-		// not valid. Revisit this error wrap when there are more potential
-		// validation failures.
-		return fmt.Errorf("unable to resolve auth secret name: %w", err)
-	}
-
-	authMode := connection.Spec.AuthMode()
-	secretName := connection.Spec.SecretName()
-
-	clientPoolKey := clientpool.ClientPoolKey{
-		HostPort:            connection.Spec.HostPort,
-		TLSServerName:       connection.Spec.TLSServerName(),
-		Namespace:           workerDeploy.Spec.WorkerOptions.TemporalNamespace,
-		SecretName:          secretName,
-		TLSCACertSecretName: connection.Spec.TLSCACertSecretName(),
-		AuthMode:            authMode,
-	}
-
-	temporalClient, ok := r.TemporalClientPool.GetSDKClient(clientPoolKey)
-	if !ok {
-		clientOpts, key, clientAuth, err := r.TemporalClientPool.ParseClientSecret(ctx, secretName, authMode, clientpool.NewClientOptions{
-			K8sNamespace:      workerDeploy.Namespace,
-			TemporalNamespace: workerDeploy.Spec.WorkerOptions.TemporalNamespace,
-			Spec:              connection.Spec,
-			Identity:          getControllerIdentity(),
-		})
-		if err != nil {
-			return fmt.Errorf("unable to parse Temporal auth secret: %w", err)
-		}
-		c, err := r.TemporalClientPool.DialAndUpsertClient(*clientOpts, *key, *clientAuth)
-		if err != nil {
-			return fmt.Errorf("unable to create TemporalClient: %w", err)
-		}
-		temporalClient = c
+	temporalClient, clientPoolKey, err := r.TemporalClientPool.GetClient(ctx,
+		connection.Spec,
+		workerDeploy.Spec.WorkerOptions.TemporalNamespace,
+		workerDeploy.Namespace,
+		config.GetControllerIdentity(),
+	)
+	if err != nil {
+		return fmt.Errorf("unable to create TemporalClient: %w", err)
 	}
 
 	// Evict cached SDK clients on failures that indicate the cached client may
@@ -684,7 +649,7 @@ func (r *WorkerDeploymentReconciler) handleDeletion(
 		if _, err := deploymentHandler.SetRampingVersion(ctx, sdkclient.WorkerDeploymentSetRampingVersionOptions{
 			BuildID:    "",
 			Percentage: 0,
-			Identity:   getControllerIdentity(),
+			Identity:   config.GetControllerIdentity(),
 		}); err != nil {
 			return fmt.Errorf("unable to clear ramping version: %w", err)
 		}
@@ -706,7 +671,7 @@ func (r *WorkerDeploymentReconciler) handleDeletion(
 		if _, err := deploymentHandler.SetCurrentVersion(ctx, sdkclient.WorkerDeploymentSetCurrentVersionOptions{
 			BuildID:                 "", // empty = unversioned
 			ConflictToken:           resp.ConflictToken,
-			Identity:                getControllerIdentity(),
+			Identity:                config.GetControllerIdentity(),
 			IgnoreMissingTaskQueues: true,
 		}); err != nil {
 			return fmt.Errorf("unable to set current version to unversioned: %w", err)
@@ -745,7 +710,7 @@ func (r *WorkerDeploymentReconciler) handleDeletion(
 		if _, err := deploymentHandler.DeleteVersion(ctx, sdkclient.WorkerDeploymentDeleteVersionOptions{
 			BuildID:      buildID,
 			SkipDrainage: true,
-			Identity:     getControllerIdentity(),
+			Identity:     config.GetControllerIdentity(),
 		}); err != nil {
 			return fmt.Errorf("unable to delete version %s (will retry): %w", buildID, err)
 		}
@@ -755,7 +720,7 @@ func (r *WorkerDeploymentReconciler) handleDeletion(
 	l.Info("Attempting to delete worker deployment from Temporal server", "name", workerDeploymentName)
 	if _, err := temporalClient.WorkerDeploymentClient().Delete(ctx, sdkclient.WorkerDeploymentDeleteOptions{
 		Name:     workerDeploymentName,
-		Identity: getControllerIdentity(),
+		Identity: config.GetControllerIdentity(),
 	}); err != nil {
 		return fmt.Errorf("unable to delete worker deployment %s (will retry): %w", workerDeploymentName, err)
 	}
@@ -786,11 +751,41 @@ func (r *WorkerDeploymentReconciler) setCondition(
 func (r *WorkerDeploymentReconciler) syncConditions(
 	twd *temporaliov1alpha1.WorkerDeployment,
 	temporalState *temporal.TemporalWorkerState,
+	blockedReason string,
 ) {
 	// Deprecated: set ConnectionHealthy=True on all successful reconciles for v1.3.x compat.
 	r.setCondition(twd, temporaliov1alpha1.ConditionConnectionHealthy, //nolint:staticcheck // backward compat
 		metav1.ConditionTrue, temporaliov1alpha1.ReasonConnectionHealthy, //nolint:staticcheck // backward compat
 		"Connection is healthy and auth secret is resolved")
+
+	// A blocked spec owns Ready, Progressing and the kstatus conditions, so the rollout
+	// state below must not flip them back and forth every reconcile. InvalidSpec is in
+	// stalledReasons: only a spec change can clear it.
+	if blockedReason != "" {
+		readyChanged := r.setCondition(twd, temporaliov1alpha1.ConditionReady,
+			metav1.ConditionFalse, temporaliov1alpha1.ReasonInvalidSpec, blockedReason)
+		progressingChanged := r.setCondition(twd, temporaliov1alpha1.ConditionProgressing,
+			metav1.ConditionFalse, temporaliov1alpha1.ReasonInvalidSpec, blockedReason)
+		r.setCondition(twd, temporaliov1alpha1.ConditionStalled,
+			metav1.ConditionTrue, temporaliov1alpha1.ReasonInvalidSpec, blockedReason)
+		r.setCondition(twd, temporaliov1alpha1.ConditionReconciling,
+			metav1.ConditionFalse, temporaliov1alpha1.ReasonInvalidSpec, blockedReason)
+		if readyChanged || progressingChanged {
+			r.Recorder.Event(twd, corev1.EventTypeWarning, temporaliov1alpha1.ReasonInvalidSpec, blockedReason)
+		}
+		return
+	}
+
+	// Reaching this point means the reconcile completed without a blocking error,
+	// so nothing is stalled whatever stage the rollout is at. Set above the switch
+	// rather than in each arm for the same reason ConnectionHealthy is: the value does
+	// not vary by rollout state, and repeating it per arm invites one arm to drift.
+	//
+	// SetStatusCondition only upserts, so a Stalled=True from an earlier blocked reconcile
+	// stays until something sets it False.
+	r.setCondition(twd, temporaliov1alpha1.ConditionStalled,
+		metav1.ConditionFalse, temporaliov1alpha1.ReasonReconcileSucceeded,
+		"Reconcile succeeded")
 
 	switch twd.Status.TargetVersion.Status {
 	case temporaliov1alpha1.VersionStatusCurrent:
@@ -801,6 +796,13 @@ func (r *WorkerDeploymentReconciler) syncConditions(
 		r.setCondition(twd, temporaliov1alpha1.ConditionReady,
 			metav1.ConditionTrue, temporaliov1alpha1.ReasonRolloutComplete,
 			fmt.Sprintf("Rollout complete for buildID %s", twd.Status.TargetVersion.BuildID))
+
+		r.setCondition(twd, temporaliov1alpha1.ConditionProgressing,
+			metav1.ConditionFalse, temporaliov1alpha1.ReasonRolloutComplete,
+			fmt.Sprintf("Target version %s is current", twd.Status.TargetVersion.BuildID))
+		r.setCondition(twd, temporaliov1alpha1.ConditionReconciling,
+			metav1.ConditionFalse, temporaliov1alpha1.ReasonRolloutComplete,
+			fmt.Sprintf("Target version %s is current", twd.Status.TargetVersion.BuildID))
 
 		r.setConditionProgressingForCurrent(twd, temporalState)
 
@@ -818,11 +820,28 @@ func (r *WorkerDeploymentReconciler) syncConditions(
 		r.setCondition(twd, temporaliov1alpha1.ConditionProgressing,
 			metav1.ConditionTrue, temporaliov1alpha1.ReasonRamping,
 			fmt.Sprintf("Target version %s is receiving a percentage of new workflows", twd.Status.TargetVersion.BuildID))
+		r.setCondition(twd, temporaliov1alpha1.ConditionReconciling,
+			metav1.ConditionTrue, temporaliov1alpha1.ReasonRamping,
+			fmt.Sprintf("Target version %s is receiving a percentage of new workflows", twd.Status.TargetVersion.BuildID))
 	case temporaliov1alpha1.VersionStatusInactive:
+		if pending := pendingTargetGroups(twd); len(pending) > 0 {
+			msg := fmt.Sprintf("Target version %s is registered but these groups are not available yet: %s",
+				twd.Status.TargetVersion.BuildID, strings.Join(pending, ", "))
+			r.setCondition(twd, temporaliov1alpha1.ConditionReady,
+				metav1.ConditionFalse, temporaliov1alpha1.ReasonWaitingForPollers, msg)
+			r.setCondition(twd, temporaliov1alpha1.ConditionProgressing,
+				metav1.ConditionTrue, temporaliov1alpha1.ReasonWaitingForPollers, msg)
+			r.setCondition(twd, temporaliov1alpha1.ConditionReconciling,
+				metav1.ConditionTrue, temporaliov1alpha1.ReasonWaitingForPollers, msg)
+			break
+		}
 		r.setCondition(twd, temporaliov1alpha1.ConditionReady,
 			metav1.ConditionFalse, temporaliov1alpha1.ReasonWaitingForPromotion,
 			fmt.Sprintf("Target version %s is registered but not yet promoted", twd.Status.TargetVersion.BuildID))
 		r.setCondition(twd, temporaliov1alpha1.ConditionProgressing,
+			metav1.ConditionTrue, temporaliov1alpha1.ReasonWaitingForPromotion,
+			fmt.Sprintf("Target version %s is waiting for promotion to current", twd.Status.TargetVersion.BuildID))
+		r.setCondition(twd, temporaliov1alpha1.ConditionReconciling,
 			metav1.ConditionTrue, temporaliov1alpha1.ReasonWaitingForPromotion,
 			fmt.Sprintf("Target version %s is waiting for promotion to current", twd.Status.TargetVersion.BuildID))
 	default: // NotRegistered or unset: workers have not started polling yet
@@ -832,12 +851,72 @@ func (r *WorkerDeploymentReconciler) syncConditions(
 		r.setCondition(twd, temporaliov1alpha1.ConditionProgressing,
 			metav1.ConditionTrue, temporaliov1alpha1.ReasonWaitingForPollers,
 			fmt.Sprintf("Waiting for workers with buildID %s to start polling", twd.Status.TargetVersion.BuildID))
+		r.setCondition(twd, temporaliov1alpha1.ConditionReconciling,
+			metav1.ConditionTrue, temporaliov1alpha1.ReasonWaitingForPollers,
+			fmt.Sprintf("Waiting for workers with buildID %s to start polling", twd.Status.TargetVersion.BuildID))
 	}
 }
 
+// stalledReasons are the blocking reasons reported through the kstatus Stalled
+// condition, which makes kstatus report Failed and lets Argo Rollouts and Helm --wait
+// fail fast instead of waiting out their timeout. Reasons absent from this set are
+// treated as transient: the controller keeps retrying and kstatus keeps reporting
+// InProgress, exactly as it did before this condition existed.
+//
+// A reason belongs here only when it is decidable from information already in hand.
+// Both entries below are settled by the spec the user just applied plus how the
+// controller was deployed; nothing arriving later can change the answer, so calling
+// them terminal can never be wrong.
+//
+// Everything else is deliberately excluded, in two groups:
+//
+//   - Waiting on another object to exist — ReasonConnectionNotFound (a Connection) and
+//     ReasonAuthSecretInvalid (a Secret, which this reason also covers when simply
+//     absent). Applying a WorkerDeployment alongside its Connection and credentials in
+//     one release gives no ordering guarantee, so a missing reference can be a normal
+//     few-second gap rather than a mistake. Reporting Failed there would abort a deploy
+//     that was about to succeed, and a false failure costs more than a slow one.
+//     Distinguishing a real typo would need a grace period — report Stalled only once
+//     the reference has been missing for a while — which lastTransitionTime already
+//     makes measurable. Until then these keep pre-existing behaviour.
+//
+//   - Transient infrastructure failures — ReasonTemporalClientCreationFailed and
+//     ReasonTemporalStateFetchFailed (server unreachable or rate limited; the
+//     ResourceExhausted paths requeue after 30s) and ReasonPlanGenerationFailed /
+//     ReasonPlanExecutionFailed (retried with backoff). Marking these Stalled would
+//     abort a deploy that is merely being throttled.
+//
+// WorkerResourceTemplate makes the same call for the same reason: a WRT whose
+// WorkerDeployment does not exist yet reports Reconciling, not Stalled. See
+// markWRTsWDNotFound.
+var stalledReasons = map[string]bool{
+	temporaliov1alpha1.ReasonInvalidSpec:                  true,
+	temporaliov1alpha1.ReasonClusterConnectionUnsupported: true,
+}
+
+// pendingTargetGroups returns the spec's groups that the target version does not have
+// available yet, or nil when the target is healthy or has no groups.
+func pendingTargetGroups(twd *temporaliov1alpha1.WorkerDeployment) []string {
+	if !twd.Spec.HasWorkerGroups() || twd.Status.TargetVersion.HealthySince != nil {
+		return nil
+	}
+	available := make(map[string]bool, len(twd.Status.TargetVersion.WorkerGroups))
+	for _, group := range twd.Status.TargetVersion.WorkerGroups {
+		available[group.Name] = group.HealthySince != nil
+	}
+	var pending []string
+	for _, group := range twd.Spec.WorkerGroupNames() {
+		if !available[group] {
+			pending = append(pending, group)
+		}
+	}
+	return pending
+}
+
 // recordWarningAndSetBlocked emits a warning event, sets Progressing=False and Ready=False
-// with the given reason, and persists the status immediately. Called on all error paths that
-// block reconciliation progress.
+// with the given reason, sets Stalled=True for reasons in stalledReasons, advances
+// status.observedGeneration, and persists the status immediately. Called on all error paths
+// that block reconciliation progress.
 func (r *WorkerDeploymentReconciler) recordWarningAndSetBlocked(
 	ctx context.Context,
 	workerDeploy *temporaliov1alpha1.WorkerDeployment,
@@ -848,6 +927,35 @@ func (r *WorkerDeploymentReconciler) recordWarningAndSetBlocked(
 	r.Recorder.Eventf(workerDeploy, corev1.EventTypeWarning, reason, "%s", eventMessage)
 	r.setCondition(workerDeploy, temporaliov1alpha1.ConditionProgressing, metav1.ConditionFalse, reason, conditionMessage)
 	r.setCondition(workerDeploy, temporaliov1alpha1.ConditionReady, metav1.ConditionFalse, reason, conditionMessage)
+
+	// Report terminal failures through the kstatus Stalled condition so consumers
+	// (Argo Rollouts, Helm --wait) fail fast instead of waiting out their timeout.
+	// Progressing=False alone cannot express this: kstatus does not read it.
+	//
+	// Both are always written, and exactly one of them is True. kstatus scans
+	// status.conditions in array order and returns on the first match, so an object
+	// carrying both as True would get a verdict that depends on which was inserted
+	// first. Writing the other as False rather than removing it keeps every condition
+	// this controller owns present on every object, whatever path produced it.
+	if stalledReasons[reason] {
+		r.setCondition(workerDeploy, temporaliov1alpha1.ConditionStalled, metav1.ConditionTrue, reason, conditionMessage)
+		r.setCondition(workerDeploy, temporaliov1alpha1.ConditionReconciling, metav1.ConditionFalse, reason, conditionMessage)
+	} else {
+		// Transient failure: the controller is still retrying (with backoff, or an
+		// explicit RequeueAfter for rate limits), so say so directly instead of
+		// leaving kstatus to infer it from the Ready=False fallback.
+		r.setCondition(workerDeploy, temporaliov1alpha1.ConditionStalled, metav1.ConditionFalse, reason, conditionMessage)
+		r.setCondition(workerDeploy, temporaliov1alpha1.ConditionReconciling, metav1.ConditionTrue, reason, conditionMessage)
+	}
+
+	// Record that this generation was observed even though it could not be
+	// reconciled: the controller has seen this spec and reached a verdict on it.
+	// Without this, status.observedGeneration lags metadata.generation on every
+	// error path that returns before generateStatus, and kstatus returns
+	// InProgress from its generation check before it ever reads the conditions
+	// set above.
+	workerDeploy.Status.ObservedGeneration = workerDeploy.Generation
+
 	// Deprecated: set ConnectionHealthy=False for v1.3.x compat, but only for
 	// reasons that actually indicate connection/auth issues. Plan generation and execution
 	// failures are unrelated to connection health and should not trigger this condition.
@@ -860,144 +968,6 @@ func (r *WorkerDeploymentReconciler) recordWarningAndSetBlocked(
 		r.setCondition(workerDeploy, temporaliov1alpha1.ConditionConnectionHealthy, metav1.ConditionFalse, reason, conditionMessage) //nolint:staticcheck // backward compat
 	}
 	_ = r.Status().Update(ctx, workerDeploy)
-}
-
-// connectionRefIsCluster reports whether ref targets a cluster-scoped ClusterConnection.
-func connectionRefIsCluster(ref temporaliov1alpha1.ConnectionReference) bool {
-	return ref.ObjectRef != nil && ref.ObjectRef.Kind == "ClusterConnection"
-}
-
-// connectionRefName returns the connection resource name from either form.
-func connectionRefName(ref temporaliov1alpha1.ConnectionReference) string {
-	if ref.ObjectRef != nil {
-		return ref.ObjectRef.Name
-	}
-	return ref.Name
-}
-
-// sameConnectionRef reports whether two connectionRefs resolve to the same connection.
-func sameConnectionRef(a, b temporaliov1alpha1.ConnectionReference) bool {
-	return connectionRefName(a) == connectionRefName(b) && connectionRefIsCluster(a) == connectionRefIsCluster(b)
-}
-
-// getConnectionByRef fetches the connection resource identified by ref and
-// returns its spec and the underlying object. namespace is used only for a
-// namespaced Connection; it is ignored for a cluster-scoped ClusterConnection.
-// The object is returned as a client.Object so callers can manage the finalizer
-// on it regardless of kind.
-func (r *WorkerDeploymentReconciler) getConnectionByRef(
-	ctx context.Context,
-	ref temporaliov1alpha1.ConnectionReference,
-	namespace string,
-) (temporaliov1alpha1.ConnectionSpec, client.Object, error) {
-	name := connectionRefName(ref)
-	if connectionRefIsCluster(ref) {
-		var cc temporaliov1alpha1.ClusterConnection
-		if err := r.Get(ctx, types.NamespacedName{Name: name}, &cc); err != nil {
-			return temporaliov1alpha1.ConnectionSpec{}, nil, err
-		}
-		return cc.Spec, &cc, nil
-	}
-	var conn temporaliov1alpha1.Connection
-	if err := r.Get(ctx, types.NamespacedName{
-		Name:      name,
-		Namespace: namespace,
-	}, &conn); err != nil {
-		return temporaliov1alpha1.ConnectionSpec{}, nil, err
-	}
-	return conn.Spec, &conn, nil
-}
-
-// ensureConnectionFinalizer adds our finalizer to the Connection so it
-// cannot be deleted while this WD still needs it for cleanup.
-func (r *WorkerDeploymentReconciler) ensureConnectionFinalizer(
-	ctx context.Context,
-	l logr.Logger,
-	conn client.Object,
-) error {
-	if !controllerutil.ContainsFinalizer(conn, finalizerName) {
-		l.Info("Adding finalizer to connection", "connection", conn.GetName())
-		controllerutil.AddFinalizer(conn, finalizerName)
-		if err := r.Update(ctx, conn); err != nil {
-			return fmt.Errorf("unable to add finalizer to connection %q: %w", conn.GetName(), err)
-		}
-	}
-	return nil
-}
-
-// releaseConnectionFinalizerIfUnused removes our finalizer from the connection
-// identified by ref, unless some other WorkerDeployment (other than
-// selfNamespace/selfName) still references it. It is used both when a WD is
-// deleted (ref = current connectionRef) and when a WD's connectionRef changes
-// (ref = previously-observed connectionRef).
-func (r *WorkerDeploymentReconciler) releaseConnectionFinalizerIfUnused(
-	ctx context.Context,
-	l logr.Logger,
-	ref temporaliov1alpha1.ConnectionReference,
-	selfNamespace, selfName string,
-) error {
-	isCluster := connectionRefIsCluster(ref)
-
-	// A namespace-scoped controller never placed a finalizer on a ClusterConnection, and
-	// cannot read one to check. Nothing to release.
-	if isCluster && r.DisableClusterConnections {
-		return nil
-	}
-
-	// Scope the "is it still used?" query correctly for the kind:
-	//   - Namespaced Connection: only WDs in its own namespace can reference it,
-	//     so restrict the list to selfNamespace.
-	//   - ClusterConnection: a WD in ANY namespace can reference it, so we must
-	//     list across all namespaces.
-	var listOpts []client.ListOption
-	if !isCluster {
-		listOpts = append(listOpts, client.InNamespace(selfNamespace))
-	}
-
-	var wds temporaliov1alpha1.WorkerDeploymentList
-	if err := r.List(ctx, &wds, listOpts...); err != nil {
-		return fmt.Errorf("unable to list WorkerDeployments: %w", err)
-	}
-
-	for i := range wds.Items {
-		wd := &wds.Items[i]
-		// Skip self by namespace and name: under a cluster-wide list, two WDs in
-		// different namespaces can share the same name, so name alone is not a
-		// unique identity.
-		if wd.Namespace == selfNamespace && wd.Name == selfName {
-			continue
-		}
-		otherRef := wd.Spec.WorkerOptions.ConnectionRef
-		// Same target only if BOTH name and (normalized) kind match, so a
-		// namespaced Connection "foo" and a ClusterConnection "foo" are distinct.
-		if connectionRefName(otherRef) == connectionRefName(ref) && connectionRefIsCluster(otherRef) == isCluster {
-			l.Info("Connection still referenced by another WorkerDeployment, keeping finalizer",
-				"connection", connectionRefName(ref), "clusterScoped", isCluster,
-				"referencedBy", wd.Name, "referencedByNamespace", wd.Namespace)
-			return nil
-		}
-	}
-
-	// Fetch by the passed ref, not the WD's current connectionRef: during a
-	// connectionRef change the WD's current ref points at the new connection, so
-	// fetching by current ref would strip the finalizer off the wrong object.
-	_, connObj, err := r.getConnectionByRef(ctx, ref, selfNamespace)
-	if err != nil {
-		if apierrors.IsNotFound(err) {
-			return nil
-		}
-		return fmt.Errorf("unable to fetch connection %q: %w", connectionRefName(ref), err)
-	}
-
-	if controllerutil.ContainsFinalizer(connObj, finalizerName) {
-		l.Info("Removing finalizer from connection", "connection", connectionRefName(ref), "clusterScoped", isCluster)
-		controllerutil.RemoveFinalizer(connObj, finalizerName)
-		if err := r.Update(ctx, connObj); err != nil {
-			return fmt.Errorf("unable to remove finalizer from connection %q: %w", connectionRefName(ref), err)
-		}
-	}
-
-	return nil
 }
 
 // SetupWithManager sets up the controller with the Manager.
@@ -1034,16 +1004,16 @@ func (r *WorkerDeploymentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		return err
 	}
 
-	recoverPanic := !r.DisableRecoverPanic
+	recoverPanic := !r.Config.DisableRecoverPanic
 	builder := ctrl.NewControllerManagedBy(mgr).
 		For(&temporaliov1alpha1.WorkerDeployment{}).
 		Owns(&appsv1.Deployment{}).
 		Watches(&temporaliov1alpha1.Connection{}, handler.EnqueueRequestsFromMapFunc(r.findTWDsUsingConnection)).
 		Watches(&temporaliov1alpha1.WorkerResourceTemplate{}, handler.EnqueueRequestsFromMapFunc(r.reconcileRequestForWRT))
-	if !r.DisableClusterConnections {
+	if !r.Config.DisableClusterConnections {
 		builder = builder.Watches(&temporaliov1alpha1.ClusterConnection{}, handler.EnqueueRequestsFromMapFunc(r.findTWDsUsingClusterConnection))
 	}
-	if !r.DisableDeprecatedTWD {
+	if !r.Config.DisableDeprecatedTWD {
 		// Watch deprecated TemporalWorkerDeployments so that any modification to an existing TWD
 		// (e.g. a status update before migration completes) triggers a reconcile of the matching WD
 		// and causes migrateFromDeprecatedTWD to run.
@@ -1089,7 +1059,7 @@ func (r *WorkerDeploymentReconciler) findTWDsUsingConnection(ctx context.Context
 	for _, twd := range twds.Items {
 		ref := twd.Spec.WorkerOptions.ConnectionRef
 		// Only namespaced Connection refs are driven by this (Connection) watch.
-		if !connectionRefIsCluster(ref) && connectionRefName(ref) == tc.GetName() {
+		if !ref.IsCluster() && ref.ResolvedName() == tc.GetName() {
 			requests = append(requests, reconcile.Request{
 				NamespacedName: types.NamespacedName{
 					Name:      twd.Name,
@@ -1117,7 +1087,7 @@ func (r *WorkerDeploymentReconciler) findTWDsUsingClusterConnection(
 	}
 	for _, twd := range twds.Items {
 		ref := twd.Spec.WorkerOptions.ConnectionRef
-		if connectionRefIsCluster(ref) && connectionRefName(ref) == cc.GetName() {
+		if ref.IsCluster() && ref.ResolvedName() == cc.GetName() {
 			requests = append(requests, reconcile.Request{
 				NamespacedName: types.NamespacedName{
 					Name:      twd.Name,

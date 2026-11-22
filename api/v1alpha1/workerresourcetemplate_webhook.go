@@ -13,6 +13,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -158,6 +159,21 @@ func (v *WorkerResourceTemplateValidator) validate(ctx context.Context, oldWRT, 
 		))
 	}
 
+	// Immutability: the template's resource type must not change on update. Resources
+	// already rendered from the old type stay owned by this WRT, but delete authorization
+	// and sunset cleanup only see the current type.
+	if oldWRT != nil {
+		oldGK, oldOK := templateGroupKind(oldWRT.Spec.Template.Raw)
+		newGK, newOK := templateGroupKind(newWRT.Spec.Template.Raw)
+		if oldOK && newOK && oldGK != newGK {
+			allErrs = append(allErrs, field.Forbidden(
+				field.NewPath("spec").Child("template"),
+				fmt.Sprintf("the template's resource type is immutable (%s cannot change to %s); "+
+					"create a new WorkerResourceTemplate for the new type instead", oldGK, newGK),
+			))
+		}
+	}
+
 	// Return early if pure validation failed (API checks won't help)
 	if len(allErrs) > 0 {
 		return warnings, apierrors.NewInvalid(
@@ -166,6 +182,8 @@ func (v *WorkerResourceTemplateValidator) validate(ctx context.Context, oldWRT, 
 			allErrs,
 		)
 	}
+
+	warnings = append(warnings, v.groupWarnings(ctx, newWRT)...)
 
 	// API-dependent checks (RESTMapper scope + SubjectAccessReview)
 	apiWarnings, apiErrs := v.validateWithAPI(ctx, newWRT, verb)
@@ -181,6 +199,43 @@ func (v *WorkerResourceTemplateValidator) validate(ctx context.Context, oldWRT, 
 	}
 
 	return warnings, nil
+}
+
+// groupWarnings warns about each listed group that the WRT's WorkerDeployment does not declare.
+// It is not an error, since the group may be added to the WorkerDeployment after the WRT.
+func (v *WorkerResourceTemplateValidator) groupWarnings(ctx context.Context, wrt *WorkerResourceTemplate) admission.Warnings {
+	if v.Client == nil || len(wrt.Spec.WorkerGroups) == 0 {
+		return nil
+	}
+	var wd WorkerDeployment
+	key := types.NamespacedName{Namespace: wrt.Namespace, Name: wrt.Spec.EffectiveWorkerDeploymentName()}
+	if err := v.Client.Get(ctx, key, &wd); err != nil {
+		return nil
+	}
+	var warns admission.Warnings
+	for i, group := range wrt.Spec.WorkerGroups {
+		if !wd.Spec.HasWorkerGroup(group) {
+			warns = append(warns, fmt.Sprintf("spec.workerGroups[%d] %q is not declared by WorkerDeployment %q", i, group, wd.Name))
+		}
+	}
+	return warns
+}
+
+// templateGroupKind returns the group and kind of a raw spec.template. ok is false
+// when either is missing or apiVersion is unparseable.
+func templateGroupKind(raw []byte) (gk schema.GroupKind, ok bool) {
+	var typeMeta struct {
+		APIVersion string `json:"apiVersion"`
+		Kind       string `json:"kind"`
+	}
+	if err := json.Unmarshal(raw, &typeMeta); err != nil || typeMeta.Kind == "" {
+		return schema.GroupKind{}, false
+	}
+	gv, err := schema.ParseGroupVersion(typeMeta.APIVersion)
+	if err != nil || gv.Version == "" {
+		return schema.GroupKind{}, false
+	}
+	return schema.GroupKind{Group: gv.Group, Kind: typeMeta.Kind}, true
 }
 
 // validateWorkerResourceTemplateSpec performs pure (no-API) validation of the spec fields.
@@ -323,6 +378,18 @@ func validateWorkerResourceTemplateSpec(spec WorkerResourceTemplateSpec, allowed
 		// (workerDeploymentName + workerDeploymentBuildId). Allow empty-string opt-in ("") and
 		// reject any other value.
 		checkKEDATriggerMetadata(innerSpec, innerSpecPath, &allErrs)
+
+		// 9. spec.targetRef: the controller owns this exact path. If {}, the controller injects
+		// the versioned Deployment; if non-empty, reject, because every rendered copy would point
+		// at the same Deployment.
+		if tr, exists := innerSpec["targetRef"]; exists && tr != nil && !isEmptyMap(tr) {
+			allErrs = append(allErrs, field.Forbidden(
+				innerSpecPath.Child("targetRef"),
+				"if targetRef is present, the controller owns it and will set it to point at the "+
+					"versioned Deployment; set it to {} to opt in to auto-injection, "+
+					"or remove it entirely if you do not need the targetRef field",
+			))
+		}
 	}
 
 	return warnings, allErrs

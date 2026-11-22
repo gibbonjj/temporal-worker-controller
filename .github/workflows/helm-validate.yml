@@ -14,19 +14,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
 
       - name: Install Helm
         uses: azure/setup-helm@5119fcb9089d432beecbf79bb2c7915207344b78 # v3.5
 
       - name: Lint chart
         run: helm lint --strict helm/temporal-worker-controller
-
-      - name: Check values.schema.json stays in sync with values.yaml
-        env:
-          GIT_REF: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
-        run: hack/check-helm-values-schema.sh
 
   helm-template:
     name: Template Helm Chart
@@ -50,6 +43,36 @@ jobs:
           helm template test-release helm/temporal-worker-controller \
             --set metrics.disableAuth=true
 
+      - name: Template with metrics disabled adds no kube-rbac-proxy
+        run: |
+          rendered=$(helm template test-release helm/temporal-worker-controller \
+            --set metrics.enabled=false)
+          ! echo "$rendered" | grep -q 'name: kube-rbac-proxy'
+
+      - name: Template with ServiceMonitor behind the auth proxy
+        run: |
+          rendered=$(helm template test-release helm/temporal-worker-controller \
+            --set prometheus.enabled=true \
+            --set prometheus.labels.release=prometheus)
+          echo "$rendered" | grep -q 'kind: ServiceMonitor'
+          echo "$rendered" | grep -q 'scheme: https'
+          echo "$rendered" | grep -q 'release: prometheus'
+
+      - name: Template with ServiceMonitor and auth proxy disabled
+        run: |
+          rendered=$(helm template test-release helm/temporal-worker-controller \
+            --set prometheus.enabled=true \
+            --set metrics.disableAuth=true)
+          echo "$rendered" | grep -q 'kind: ServiceMonitor'
+          echo "$rendered" | grep -q 'scheme: http$'
+          # With the auth proxy off, this chart's prometheus template must create the Service itself.
+          service=$(helm template test-release helm/temporal-worker-controller \
+            --set prometheus.enabled=true \
+            --set metrics.disableAuth=true \
+            --show-only templates/prometheus.yaml)
+          echo "$service" | grep -q '^kind: Service$'
+          echo "$service" | grep -q 'name: test-release-metrics-service'
+
       - name: Template with kube-rbac-proxy image override
         run: |
           helm template test-release helm/temporal-worker-controller \
@@ -62,6 +85,29 @@ jobs:
         run: |
           helm template test-release helm/temporal-worker-controller \
             --set 'rbac.restrictWatchNamespaces={ns-a,ns-b}'
+
+      - name: Template with topologySpreadConstraints
+        run: |
+          set -euo pipefail
+          spread=(
+            --set 'topologySpreadConstraints[0].maxSkew=1'
+            --set 'topologySpreadConstraints[0].topologyKey=topology.kubernetes.io/zone'
+            --set 'topologySpreadConstraints[0].whenUnsatisfiable=ScheduleAnyway'
+          )
+          # the default podAntiAffinity is kept alongside topologySpreadConstraints
+          rendered=$(helm template test-release helm/temporal-worker-controller \
+            --show-only templates/manager.yaml "${spread[@]}")
+          echo "$rendered" | grep -q 'topologyKey: topology.kubernetes.io/zone'
+          echo "$rendered" | grep -q 'podAntiAffinity'
+          # and can be turned off with defaultPodAntiAffinity=false
+          rendered=$(helm template test-release helm/temporal-worker-controller \
+            --show-only templates/manager.yaml "${spread[@]}" \
+            --set defaultPodAntiAffinity=false)
+          echo "$rendered" | grep -q 'topologyKey: topology.kubernetes.io/zone'
+          if echo "$rendered" | grep -q 'affinity:'; then
+            echo "affinity rendered with defaultPodAntiAffinity=false"
+            exit 1
+          fi
 
       - name: Template with stripped WRT HPA matchLabel prefixes
         run: |
@@ -142,6 +188,19 @@ jobs:
       - name: Regenerate and diff
         run: make manifests && git diff --exit-code helm/temporal-worker-controller/templates/rbac.yaml
 
+  helm-check-values-schema:
+    name: Check values.schema.json is generated
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Regenerate and diff
+        run: make helm-values-schema && git diff --exit-code helm/temporal-worker-controller/values.schema.json
+
   helm-validate-succeed:
     name: All Helm Validations Succeed
     needs:
@@ -150,6 +209,7 @@ jobs:
       - helm-lint-crds
       - helm-template-crds
       - helm-check-rbac
+      - helm-check-values-schema
     runs-on: ubuntu-latest
     if: always()
     env:

@@ -128,6 +128,40 @@ func TestWorkerDeployment_ValidateCreate(t *testing.T) {
 		"valid temporal worker deployment": {
 			obj: testhelpers.MakeWDWithName("valid-worker", ""),
 		},
+		"deploymentLabels with valid keys and values": {
+			obj: testhelpers.ModifyObj(testhelpers.MakeWDWithName("valid-deployment-labels", ""), func(obj *temporaliov1alpha1.WorkerDeployment) *temporaliov1alpha1.WorkerDeployment {
+				obj.Spec.DeploymentLabels = map[string]string{"team": "payments", "example.com/instrumentation": "false", "empty": ""}
+				return obj
+			}),
+		},
+		// Without this check the CRD accepts the label and the controller then fails
+		// to create the versioned Deployment, which stalls the rollout.
+		"deploymentLabels with an invalid value": {
+			obj: testhelpers.ModifyObj(testhelpers.MakeWDWithName("invalid-deployment-label-value", ""), func(obj *temporaliov1alpha1.WorkerDeployment) *temporaliov1alpha1.WorkerDeployment {
+				obj.Spec.DeploymentLabels = map[string]string{"team": "foo bar"}
+				return obj
+			}),
+			errorMsg: `spec.deploymentLabels: Invalid value: "foo bar"`,
+		},
+		"deploymentLabels with an invalid key": {
+			obj: testhelpers.ModifyObj(testhelpers.MakeWDWithName("invalid-deployment-label-key", ""), func(obj *temporaliov1alpha1.WorkerDeployment) *temporaliov1alpha1.WorkerDeployment {
+				obj.Spec.DeploymentLabels = map[string]string{"-team": "payments"}
+				return obj
+			}),
+			errorMsg: `spec.deploymentLabels: Invalid value: "-team"`,
+		},
+		"group deploymentLabels with an invalid value": {
+			obj: testhelpers.ModifyObj(testhelpers.MakeWDWithName("invalid-group-label-value", ""), func(obj *temporaliov1alpha1.WorkerDeployment) *temporaliov1alpha1.WorkerDeployment {
+				obj.Spec.WorkerGroups = []temporaliov1alpha1.WorkerGroup{{
+					Name:             "activities",
+					Deployment:       *obj.Spec.Deployment.DeepCopy(),
+					DeploymentLabels: map[string]string{"team": "foo bar"},
+				}}
+				obj.Spec.Deployment = nil
+				return obj
+			}),
+			errorMsg: `spec.workerGroups[0].deploymentLabels: Invalid value: "foo bar"`,
+		},
 		"invalid object type": {
 			obj: &corev1.Pod{
 				ObjectMeta: metav1.ObjectMeta{
@@ -192,6 +226,89 @@ func TestWorkerDeployment_DeprecatedFieldEmitsWarning(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, warns, 1)
 	assert.Contains(t, warns[0], "spec.replicas is deprecated; use spec.deployment.replicas instead")
+}
+
+func TestWorkerDeployment_GroupSelectorEmitsWarning(t *testing.T) {
+	ctx := context.Background()
+	dep := testhelpers.MakeWDWithName("valid-worker", "")
+	dep.Spec.WorkerGroups = []temporaliov1alpha1.WorkerGroup{
+		{Name: "plain", Deployment: *dep.Spec.Deployment.DeepCopy()},
+		{Name: "selected", Deployment: *dep.Spec.Deployment.DeepCopy()},
+	}
+	dep.Spec.Deployment = nil
+	dep.Spec.WorkerGroups[1].Deployment.Selector = &metav1.LabelSelector{MatchLabels: map[string]string{"app": "worker"}}
+
+	webhook := &temporaliov1alpha1.WorkerDeployment{}
+	warns, err := webhook.ValidateCreate(ctx, dep)
+
+	require.NoError(t, err)
+	require.Len(t, warns, 1)
+	assert.Contains(t, warns[0], "spec.workerGroups[1].deployment.selector is ignored")
+}
+
+func TestWorkerDeployment_WorkerGroupsWarnAboutIgnoredFields(t *testing.T) {
+	ctx := context.Background()
+	dep := testhelpers.MakeWDWithName("valid-worker", "")
+	dep.Spec.WorkerGroups = []temporaliov1alpha1.WorkerGroup{{Name: "activities", Deployment: *dep.Spec.Deployment.DeepCopy()}}
+	dep.Spec.Deployment = nil
+	progressDeadline := int32(600) // the CRD default
+	dep.Spec.ProgressDeadlineSeconds = &progressDeadline
+	webhook := &temporaliov1alpha1.WorkerDeployment{}
+
+	warns, err := webhook.ValidateCreate(ctx, dep)
+	require.NoError(t, err)
+	assert.Empty(t, warns, "the defaulted progressDeadlineSeconds is not a user mistake")
+
+	replicas := int32(3)
+	dep.Spec.Replicas = &replicas
+	dep.Spec.MinReadySeconds = 10
+	warns, err = webhook.ValidateCreate(ctx, dep)
+	require.NoError(t, err)
+	require.Len(t, warns, 2)
+	assert.Contains(t, warns[0], "spec.minReadySeconds is ignored with spec.workerGroups")
+	assert.Contains(t, warns[1], "spec.replicas is ignored with spec.workerGroups")
+}
+
+func TestWorkerDeployment_DrainingReplicasWarning(t *testing.T) {
+	drainingReplicas := int32(1)
+	deploymentReplicas := int32(3)
+	tests := map[string]struct {
+		deploymentReplicas *int32
+		// deprecatedReplicas sets the deprecated top-level spec.replicas
+		// field and leaves spec.deployment nil.
+		deprecatedReplicas *int32
+		wantWarnings       []string
+	}{
+		"controller manages replicas": {deploymentReplicas: &deploymentReplicas},
+		"controller manages replicas via deprecated field": {
+			deprecatedReplicas: &deploymentReplicas,
+			wantWarnings:       []string{"spec.replicas is deprecated"},
+		},
+		"autoscaler manages replicas": {
+			wantWarnings: []string{"spec.drainingDeployment.replicas is ignored"},
+		},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			dep := testhelpers.MakeWDWithName("valid-worker", "")
+			dep.Spec.Deployment.Replicas = tc.deploymentReplicas
+			if tc.deprecatedReplicas != nil {
+				dep.Spec.Replicas = tc.deprecatedReplicas
+				dep.Spec.Deployment = nil
+			}
+			dep.Spec.DrainingDeployment = &temporaliov1alpha1.DrainingDeploymentSpec{Replicas: &drainingReplicas}
+
+			webhook := &temporaliov1alpha1.WorkerDeployment{}
+			warns, err := webhook.ValidateCreate(context.Background(), dep)
+
+			require.NoError(t, err)
+			require.Len(t, warns, len(tc.wantWarnings))
+			for i, want := range tc.wantWarnings {
+				assert.Contains(t, warns[i], want)
+			}
+		})
+	}
 }
 
 func TestWorkerDeployment_ValidateUpdate(t *testing.T) {
@@ -273,4 +390,25 @@ func TestWorkerDeployment_Default(t *testing.T) {
 			tc.expected(t, obj)
 		})
 	}
+}
+
+func TestWorkerDeployment_GroupDrainingReplicasWarning(t *testing.T) {
+	three, one := int32(3), int32(1)
+	dep := testhelpers.MakeWDWithName("valid-worker", "")
+	managed := *dep.Spec.Deployment.DeepCopy()
+	managed.Replicas = &three
+	autoscaled := *dep.Spec.Deployment.DeepCopy()
+	autoscaled.Replicas = nil
+	draining := &temporaliov1alpha1.DrainingDeploymentSpec{Replicas: &one}
+	dep.Spec.WorkerGroups = []temporaliov1alpha1.WorkerGroup{
+		{Name: "managed", Deployment: managed, DrainingDeployment: draining},
+		{Name: "autoscaled", Deployment: autoscaled, DrainingDeployment: draining},
+	}
+	dep.Spec.Deployment = nil
+
+	warns, err := (&temporaliov1alpha1.WorkerDeployment{}).ValidateCreate(context.Background(), dep)
+
+	require.NoError(t, err)
+	require.Len(t, warns, 1)
+	assert.Contains(t, warns[0], "spec.workerGroups[1].drainingDeployment.replicas is ignored because spec.workerGroups[1].deployment.replicas is not set")
 }

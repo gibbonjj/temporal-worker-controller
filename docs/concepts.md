@@ -29,8 +29,8 @@ The Kubernetes Custom Resource Definition that manages one Temporal Worker Deplo
 The actual Kubernetes `Deployment` resources that run worker pods. The controller automatically creates these - you don't manage them directly.
 
 **Key characteristics:**
-- Multiple Kubernetes `Deployment` resources per `WorkerDeployment` Custom Resource (one per version)
-- Named with the pattern: `{worker-deployment-name}-{build-id}` (e.g., `staging/payment-processor-v1.5.1`)
+- Multiple Kubernetes `Deployment` resources per `WorkerDeployment` Custom Resource (one per version, or one per [worker group](#worker-groups) per version)
+- Named with the pattern: `{worker-deployment-name}-{build-id}` (e.g., `staging/payment-processor-v1.5.1`). With worker groups, `{worker-deployment-name}-{group}-{build-id}-{hash}`
 - Each runs a specific version of your worker code
 
 ### Key Relationship
@@ -91,7 +91,7 @@ Gradually increases the percentage of new workflow executions routed to the new 
 
 ### Worker Options
 Configuration for the controller's Temporal connection and worker-version identity:
-- **connectionRef**: A reference to a `Connection` custom resource. This object contains a `name` field to specify the `Connection` resource.
+- **connectionRef**: A reference to the connection resource. Use `name` for a `Connection` in the same namespace, or `objectRef` to reference a `Connection` or a cluster-scoped [`ClusterConnection`](cluster-connection.md).
 - **temporalNamespace**: The Temporal namespace to connect to
 - **unsafeCustomBuildID**: Optionally overrides the auto-generated Build ID. When set, pod template changes trigger rolling updates of the existing version instead of new-version rollouts, so workers running different code can share one Build ID — if workflow code changes while the ID stays constant, Pinned workflows may execute on workers with incompatible code. Only use it with a reliable external change-detection scheme (for example, hashing workflow sources in CI).
 
@@ -133,6 +133,9 @@ Defines how Drained versions are cleaned up:
 
 ### Template
 The pod template used for the target version of this worker deployment. Similar to the pod template used in a standar Kubernetes `Deployment`, but managed by the controller.
+
+### Worker Groups
+Named groups of workers in one `WorkerDeployment`, set with `spec.workerGroups` in place of `spec.deployment`. Each group has its own Kubernetes `Deployment` spec, so its own pod template, replicas and placement. All groups share the Worker Deployment name and Build ID, so they belong to one Worker Deployment Version and roll out together. See [Worker Groups](worker-groups.md).
 
 ## Environment Variables
 

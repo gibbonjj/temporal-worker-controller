@@ -5,11 +5,13 @@
 package controller
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -18,6 +20,8 @@ import (
 	"github.com/temporalio/temporal-worker-controller/internal/defaults"
 	"github.com/temporalio/temporal-worker-controller/internal/k8s"
 	"github.com/temporalio/temporal-worker-controller/internal/planner"
+	"github.com/temporalio/temporal-worker-controller/pkg/controller/config"
+	"github.com/temporalio/temporal-worker-controller/pkg/controller/version"
 	commonpb "go.temporal.io/api/common/v1"
 	enumspb "go.temporal.io/api/enums/v1"
 	"go.temporal.io/api/serviceerror"
@@ -28,6 +32,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	autoscalingv1 "k8s.io/api/autoscaling/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -39,26 +44,26 @@ import (
 
 // executeK8sOperations executes the Kubernetes operations contained in the plan: creating,
 // deleting, scaling, and updating Deployments, and deleting the rendered WRT resources of
-// sunset or orphaned build IDs. It returns the refs from p.DeleteWorkerResources whose
+// sunset, unselected, or orphaned build IDs. It returns the refs from p.DeleteWorkerResources whose
 // delete was confirmed this cycle — the delete succeeded or the resource was already gone
 // (NotFound). executePlan prunes the WRT status entries matching the returned refs; entries
 // for unconfirmed deletes are retained so the planner re-derives and retries the delete on
 // the next reconcile. Rendered-resource delete failures are logged rather than returned as
 // errors, so the returned slice can be partial even when the error is nil.
 func (r *WorkerDeploymentReconciler) executeK8sOperations(ctx context.Context, l logr.Logger, workerDeploy *temporaliov1alpha1.WorkerDeployment, p *plan) ([]planner.WorkerResourceRef, error) {
-	// Create deployment
-	if p.CreateDeployment != nil {
-		l.Info("creating deployment", "deployment", p.CreateDeployment.Name)
-		if err := r.Create(ctx, p.CreateDeployment); err != nil {
-			l.Error(err, "unable to create deployment", "deployment", p.CreateDeployment.Name)
+	// Create deployments
+	for _, d := range p.CreateDeployments {
+		l.Info("creating deployment", "deployment", d.Name)
+		if err := r.Create(ctx, d); err != nil {
+			l.Error(err, "unable to create deployment", "deployment", d.Name)
 			r.Recorder.Eventf(workerDeploy, corev1.EventTypeWarning, ReasonDeploymentCreateFailed,
-				"Failed to create Deployment %q: %v", p.CreateDeployment.Name, err)
+				"Failed to create Deployment %q: %v", d.Name, err)
 			return nil, err
 		}
 	}
 
 	// Delete deployments
-	for _, d := range p.DeleteDeployments {
+	for _, d := range slices.Concat(p.DeleteDeployments, p.DeleteWorkerGroupDeployments) {
 		l.Info("deleting deployment", "deployment", d.Name)
 		if err := r.Delete(ctx, d); err != nil {
 			l.Error(err, "unable to delete deployment", "deployment", d.Name)
@@ -68,8 +73,9 @@ func (r *WorkerDeploymentReconciler) executeK8sOperations(ctx context.Context, l
 		}
 	}
 
-	// Delete rendered WRT resources whose versioned Deployment is being sunset, or whose
-	// WRT status entry is orphaned (its build ID has no versioned Deployment anymore).
+	// Delete rendered WRT resources whose versioned Deployment is being sunset, whose
+	// version status the WRT no longer selects, or whose WRT status entry is orphaned
+	// (its build ID has no versioned Deployment anymore).
 	// Rendered resources are owned by the WRT (not the Deployment), so k8s GC does not
 	// clean them up when the Deployment is deleted; the controller does it here instead.
 	// Errors are logged and skipped: the WRT status entry for the build ID is only pruned
@@ -89,12 +95,18 @@ func (r *WorkerDeploymentReconciler) executeK8sOperations(ctx context.Context, l
 		obj.SetName(res.Name)
 		// A NotFound result counts as a successful delete: the resource is confirmed gone.
 		if err := r.Delete(ctx, obj); client.IgnoreNotFound(err) != nil {
-			l.Error(err, "unable to delete worker resource on version sunset",
-				"apiVersion", res.APIVersion, "kind", res.Kind, "name", res.Name)
+			l.Error(err, "unable to delete rendered worker resource",
+				"apiVersion", res.APIVersion, "kind", res.Kind, "name", res.Name,
+				"wrt", res.WRTName, "buildID", res.BuildID)
 		} else {
 			deletedWorkerResources = append(deletedWorkerResources, res)
-			l.Info("deleted worker resource on version sunset",
-				"apiVersion", res.APIVersion, "kind", res.Kind, "name", res.Name)
+			// Some copies are deleted in every cycle (see getDeleteWorkerResources), so
+			// NotFound is the usual result and is not logged.
+			if err == nil {
+				l.Info("deleted rendered worker resource",
+					"apiVersion", res.APIVersion, "kind", res.Kind, "name", res.Name,
+					"wrt", res.WRTName, "buildID", res.BuildID)
+			}
 		}
 	}
 
@@ -132,7 +144,7 @@ func (r *WorkerDeploymentReconciler) executeK8sOperations(ctx context.Context, l
 	// Update deployments
 	for _, d := range p.UpdateDeployments {
 		// No point in updating a deleted Deployment...
-		if containsDeployment(d, p.DeleteDeployments) {
+		if containsDeployment(d, p.DeleteDeployments) || containsDeployment(d, p.DeleteWorkerGroupDeployments) {
 			continue
 		}
 		l.Info("updating deployment", "deployment", d.Name, "namespace", d.Namespace)
@@ -155,14 +167,26 @@ func buildIDForDeployment(workerDeploy *temporaliov1alpha1.WorkerDeployment, dep
 			versionDeployment.Name == deployment.Name
 	}
 
-	if matches(workerDeploy.Status.TargetVersion.Deployment) {
+	matchesVersion := func(v temporaliov1alpha1.BaseWorkerDeploymentVersion) bool {
+		if matches(v.Deployment) {
+			return true
+		}
+		for _, group := range v.WorkerGroups {
+			if matches(group.Deployment) {
+				return true
+			}
+		}
+		return false
+	}
+
+	if matchesVersion(workerDeploy.Status.TargetVersion.BaseWorkerDeploymentVersion) {
 		return workerDeploy.Status.TargetVersion.BuildID
 	}
-	if workerDeploy.Status.CurrentVersion != nil && matches(workerDeploy.Status.CurrentVersion.Deployment) {
+	if workerDeploy.Status.CurrentVersion != nil && matchesVersion(workerDeploy.Status.CurrentVersion.BaseWorkerDeploymentVersion) {
 		return workerDeploy.Status.CurrentVersion.BuildID
 	}
 	for _, version := range workerDeploy.Status.DeprecatedVersions {
-		if version != nil && matches(version.Deployment) {
+		if version != nil && matchesVersion(version.BaseWorkerDeploymentVersion) {
 			return version.BuildID
 		}
 	}
@@ -302,7 +326,7 @@ func (r *WorkerDeploymentReconciler) shouldClaimManagerIdentity(vcfg *planner.Ve
 
 	// Handle Worker Deployments that were controller-managed before we
 	// started recording the cluster-UID in the manager identity
-	if existing == getDeprecatedControllerIdentity() {
+	if existing == config.GetDeprecatedControllerIdentity() {
 		return true
 	}
 	return false
@@ -315,14 +339,14 @@ func (r *WorkerDeploymentReconciler) claimManagerIdentity(
 	deploymentHandler sdkclient.WorkerDeploymentHandle,
 	vcfg *planner.VersionConfig,
 ) error {
-	identity := getControllerIdentity()
+	identity := config.GetControllerIdentity()
 	if identity == "" {
 		// Passing an empty identity to SetManagerIdentity clears the field on the
 		// Worker Deployment, leaving it ownerless. Refuse rather than cause that.
 		// This should never happen, but this is the extra fallback in case somehow
 		// the check in main() and Reconcile() are not sufficient.
 		return errors.New(fmt.Sprintf("%s and %s are not set; refusing to call SetManagerIdentity to avoid clearing the manager identity field",
-			IdentityEnvKey, IdentitySuffixEnvKey))
+			config.IdentityEnvKey, config.IdentitySuffixEnvKey))
 	}
 	resp, err := deploymentHandler.SetManagerIdentity(ctx, sdkclient.WorkerDeploymentSetManagerIdentityOptions{
 		Self:          true,
@@ -358,7 +382,7 @@ func (r *WorkerDeploymentReconciler) updateVersionConfig(ctx context.Context, l 
 		if _, err := deploymentHandler.SetCurrentVersion(ctx, sdkclient.WorkerDeploymentSetCurrentVersionOptions{
 			BuildID:       vcfg.BuildID,
 			ConflictToken: vcfg.ConflictToken,
-			Identity:      getControllerIdentity(),
+			Identity:      config.GetControllerIdentity(),
 		}); err != nil {
 			l.Error(err, "unable to set current deployment version", "buildID", vcfg.BuildID)
 			r.Recorder.Eventf(workerDeploy, corev1.EventTypeWarning, ReasonVersionPromotionFailed,
@@ -381,7 +405,7 @@ func (r *WorkerDeploymentReconciler) updateVersionConfig(ctx context.Context, l 
 			BuildID:       vcfg.BuildID,
 			Percentage:    float32(vcfg.RampPercentage),
 			ConflictToken: vcfg.ConflictToken,
-			Identity:      getControllerIdentity(),
+			Identity:      config.GetControllerIdentity(),
 		}); err != nil {
 			l.Error(err, "unable to set ramping deployment version", "buildID", vcfg.BuildID, "percentage", vcfg.RampPercentage)
 			r.Recorder.Eventf(workerDeploy, corev1.EventTypeWarning, ReasonVersionPromotionFailed,
@@ -405,8 +429,8 @@ func (r *WorkerDeploymentReconciler) updateVersionConfig(ctx context.Context, l 
 		},
 		MetadataUpdate: sdkclient.WorkerDeploymentMetadataUpdate{
 			UpsertEntries: map[string]interface{}{
-				IdentityMetadataKey: getControllerIdentity(),
-				VersionMetadataKey:  getControllerVersion(),
+				IdentityMetadataKey: config.GetControllerIdentity(),
+				VersionMetadataKey:  version.GetControllerVersion(),
 			},
 		},
 	}); err != nil { // would be cool to do this atomically with the update
@@ -457,10 +481,15 @@ func (r *WorkerDeploymentReconciler) executeWRTOperations(
 	type wrtKey struct{ namespace, name string }
 	type applyResult struct {
 		buildID      string
+		group        string
 		resourceName string
 		hash         string // rendered hash recorded on successful apply; "" on error
 		err          error
 		skipped      bool // true if the apply was skipped because the rendered hash is unchanged
+		// renderFailed distinguishes a spec.template render failure from an SSA apply
+		// failure. Render failures are always terminal as only a spec change can fix
+		// them while apply failures are classified by API error kind.
+		renderFailed bool
 	}
 	wrtResults := make(map[wrtKey][]applyResult)
 
@@ -474,8 +503,10 @@ func (r *WorkerDeploymentReconciler) executeWRTOperations(
 				"buildID", apply.BuildID,
 			)
 			wrtResults[key] = append(wrtResults[key], applyResult{
-				buildID: apply.BuildID,
-				err:     apply.RenderError,
+				buildID:      apply.BuildID,
+				group:        apply.WorkerGroup,
+				err:          apply.RenderError,
+				renderFailed: true,
 			})
 			continue
 		}
@@ -487,6 +518,7 @@ func (r *WorkerDeploymentReconciler) executeWRTOperations(
 		if apply.RenderedHash != "" && apply.RenderedHash == apply.LastAppliedHash {
 			wrtResults[key] = append(wrtResults[key], applyResult{
 				buildID:      apply.BuildID,
+				group:        apply.WorkerGroup,
 				resourceName: apply.Resource.GetName(),
 				hash:         apply.RenderedHash,
 				skipped:      true,
@@ -529,6 +561,7 @@ func (r *WorkerDeploymentReconciler) executeWRTOperations(
 		}
 		wrtResults[key] = append(wrtResults[key], applyResult{
 			buildID:      apply.BuildID,
+			group:        apply.WorkerGroup,
 			resourceName: apply.Resource.GetName(),
 			hash:         appliedHash,
 			err:          applyErr,
@@ -541,36 +574,74 @@ func (r *WorkerDeploymentReconciler) executeWRTOperations(
 	// surviving entry is what makes the planner re-derive the delete next cycle, and
 	// pruning it on success is what allows a later redeploy of the same build ID to be
 	// re-applied instead of being skipped against a stale hash.
-	deletedBuildIDs := make(map[wrtKey]map[string]struct{})
+	deletedCopies := make(map[wrtKey]map[k8s.WorkerResourceCopy]struct{})
 	for _, ref := range deletedWorkerResources {
 		if ref.WRTName == "" || ref.BuildID == "" {
 			continue
 		}
 		key := wrtKey{ref.Namespace, ref.WRTName}
-		if deletedBuildIDs[key] == nil {
-			deletedBuildIDs[key] = make(map[string]struct{})
+		if deletedCopies[key] == nil {
+			deletedCopies[key] = make(map[k8s.WorkerResourceCopy]struct{})
 		}
-		deletedBuildIDs[key][ref.BuildID] = struct{}{}
+		deletedCopies[key][ref.Copy()] = struct{}{}
 	}
 
-	// Write per-Build-ID status back to each WRT that had an apply or a confirmed delete.
+	// Write per-Build-ID status back to each WRT that had an apply or a confirmed delete,
+	// and to each WRT that renders no copy but has a status that is behind (see below).
 	// Done after all applies so a single failed apply does not prevent status
 	// updates for the other (WRT, Build ID) pairs.
 	// If every result for a WRT was skipped (hash unchanged since last successful
 	// apply) and none of its rendered resources were deleted, the status is already
 	// correct — skip the status write entirely to avoid unnecessary resourceVersion bumps.
-	statusKeys := make(map[wrtKey]struct{}, len(wrtResults)+len(deletedBuildIDs))
+	statusKeys := make(map[wrtKey]struct{}, len(wrtResults)+len(deletedCopies)+len(p.WorkerResourceTemplates))
 	for key := range wrtResults {
 		statusKeys[key] = struct{}{}
 	}
-	for key := range deletedBuildIDs {
+	for key := range deletedCopies {
 		statusKeys[key] = struct{}{}
+	}
+	for i := range p.WorkerResourceTemplates {
+		wrt := &p.WorkerResourceTemplates[i]
+		statusKeys[wrtKey{wrt.Namespace, wrt.Name}] = struct{}{}
+	}
+	// WRTs with a missing or recovered group get no applies, so nothing else rewrites their Ready condition.
+	missingGroups := make(map[wrtKey][]string, len(p.WRTsWithMissingWorkerGroups))
+	for name, groups := range p.WRTsWithMissingWorkerGroups {
+		missingGroups[wrtKey{workerDeploy.Namespace, name}] = groups
+	}
+	staleGroup := make(map[wrtKey]bool, len(p.WRTsWithStaleWorkerGroupNotFound))
+	for _, name := range p.WRTsWithStaleWorkerGroupNotFound {
+		staleGroup[wrtKey{workerDeploy.Namespace, name}] = true
 	}
 
 	var applyErrs, statusErrs []error
 	for key := range statusKeys {
 		results := wrtResults[key]
-		deleted := deletedBuildIDs[key]
+
+		wrt := &temporaliov1alpha1.WorkerResourceTemplate{}
+		if err := r.Get(ctx, types.NamespacedName{Namespace: key.namespace, Name: key.name}, wrt); err != nil {
+			if client.IgnoreNotFound(err) != nil {
+				statusErrs = append(statusErrs, fmt.Errorf("get WRT %s/%s for status update: %w", key.namespace, key.name, err))
+			}
+			continue
+		}
+
+		// Some copies are deleted in every cycle (see getDeleteWorkerResources), and a
+		// NotFound delete is confirmed too. Only a delete that prunes a status entry
+		// changes the status, so count only those.
+		deleted := make(map[k8s.WorkerResourceCopy]struct{})
+		for _, v := range wrt.Status.Versions {
+			if _, ok := deletedCopies[key][k8s.WorkerResourceCopyOf(v)]; ok {
+				deleted[k8s.WorkerResourceCopyOf(v)] = struct{}{}
+			}
+		}
+		_, missingGroup := missingGroups[key]
+
+		// While a versioned Deployment has an unknown version status, a WRT that selects
+		// by status cannot tell whether it selects that version, and the copy it keeps of
+		// the version may be out of date. So the WRT keeps the generation and conditions
+		// of its last full evaluation, unless an apply fails.
+		statusUnknown := p.UnknownVersionStatus && len(wrt.Spec.VersionStatuses) > 0
 
 		allSkipped := true
 		for _, res := range results {
@@ -579,32 +650,62 @@ func (r *WorkerDeploymentReconciler) executeWRTOperations(
 				break
 			}
 		}
-		if allSkipped && len(deleted) == 0 {
+		if len(results) == 0 && len(deleted) == 0 && !missingGroup {
+			// The WRT renders no copy this cycle. Record its generation and Ready
+			// condition when they are behind or Ready is not True, for example after
+			// markWRTsWDNotFound ran before the WorkerDeployment existed, or after its
+			// group was missing. Otherwise kstatus reports the WRT InProgress until a
+			// copy is rendered.
+			ready := apimeta.FindStatusCondition(wrt.Status.Conditions, temporaliov1alpha1.ConditionReady)
+			upToDate := wrt.Status.ObservedGeneration == wrt.Generation &&
+				ready != nil && ready.ObservedGeneration == wrt.Generation && ready.Status == metav1.ConditionTrue
+			if statusUnknown || upToDate {
+				continue
+			}
+		} else if allSkipped && len(deleted) == 0 && !missingGroup && !staleGroup[key] {
+			// Every apply was a no-op and nothing was deleted, so the per-Build-ID
+			// status and conditions are already correct. The one thing that can still
+			// be stale is status.observedGeneration.
+			//
+			// metadata.generation tracks any semantic change to the spec, while the
+			// skip decision above is made on a hash of the rendered output. Those two
+			// can come apart. Switching spec.temporalWorkerDeploymentRef to
+			// spec.workerDeploymentRef with the same name is such a case: the webhook
+			// permits it (only the effective name is immutable) and it is step 4 of the
+			// CRD rename migration, but rendering does not depend on which ref field
+			// was used, so the hash is unchanged, every apply is skipped and no status
+			// write happens. A stale observedGeneration would make kstatus report
+			// InProgress forever.
+			//
+			// The WRT was already fetched from the informer cache above, and the write
+			// only happens when something has actually changed.
+			if wrt.Status.ObservedGeneration != wrt.Generation && !statusUnknown {
+				wrt.Status.ObservedGeneration = wrt.Generation
+				if err := r.Status().Update(ctx, wrt); err != nil {
+					statusErrs = append(statusErrs, fmt.Errorf("refresh observedGeneration for WRT %s/%s: %w", key.namespace, key.name, err))
+				}
+			}
 			continue
 		}
 
-		wrt := &temporaliov1alpha1.WorkerResourceTemplate{}
-		if err := r.Get(ctx, types.NamespacedName{Namespace: key.namespace, Name: key.name}, wrt); err != nil {
-			statusErrs = append(statusErrs, fmt.Errorf("get WRT %s/%s for status update: %w", key.namespace, key.name, err))
-			continue
-		}
-
-		// Build the new per-Build-ID version list.
-		// For BuildIDs whose apply was skipped (rendered hash unchanged), we copy the
+		// Build the new per-copy version list.
+		// For copies whose apply was skipped (rendered hash unchanged), we copy the
 		// existing status entry verbatim — the stored LastAppliedHash and
 		// LastTransitionTime must not be overwritten with a no-op entry.
-		existingByBuildID := make(map[string]temporaliov1alpha1.WorkerResourceTemplateVersionStatus, len(wrt.Status.Versions))
+		existingByCopy := make(map[k8s.WorkerResourceCopy]temporaliov1alpha1.WorkerResourceTemplateVersionStatus, len(wrt.Status.Versions))
 		for _, v := range wrt.Status.Versions {
-			existingByBuildID[v.BuildID] = v
+			existingByCopy[k8s.WorkerResourceCopyOf(v)] = v
 		}
 
 		versions := make([]temporaliov1alpha1.WorkerResourceTemplateVersionStatus, 0, len(results))
-		coveredByApply := make(map[string]struct{}, len(results))
+		coveredByApply := make(map[k8s.WorkerResourceCopy]struct{}, len(results))
 		anyFailed := false
+		anyTerminal := false
 		for _, result := range results {
-			coveredByApply[result.buildID] = struct{}{}
+			c := k8s.WorkerResourceCopy{BuildID: result.buildID, WorkerGroup: cmp.Or(result.group, temporaliov1alpha1.DefaultWorkerGroupName)}
+			coveredByApply[c] = struct{}{}
 			if result.skipped {
-				if existing, ok := existingByBuildID[result.buildID]; ok {
+				if existing, ok := existingByCopy[c]; ok {
 					versions = append(versions, existing)
 				}
 				continue
@@ -615,6 +716,9 @@ func (r *WorkerDeploymentReconciler) executeWRTOperations(
 				applyErrs = append(applyErrs, result.err)
 				applyErr = result.err.Error()
 				anyFailed = true
+				if isTerminalWorkerResourceError(result.err, result.renderFailed) {
+					anyTerminal = true
+				}
 				// 0 means "unset" / "not yet successfully applied at current generation".
 				// Failure Message and LastTransitionTime are still recorded below.
 				appliedGeneration = 0
@@ -622,7 +726,7 @@ func (r *WorkerDeploymentReconciler) executeWRTOperations(
 				appliedGeneration = wrt.Generation
 			}
 			versions = append(versions, k8s.WorkerResourceTemplateVersionStatusForBuildID(
-				result.buildID, result.resourceName, appliedGeneration, result.hash, applyErr,
+				result.buildID, result.group, result.resourceName, appliedGeneration, result.hash, applyErr,
 			))
 		}
 
@@ -631,45 +735,108 @@ func (r *WorkerDeploymentReconciler) executeWRTOperations(
 		// neither applied nor confirmed-deleted (e.g. the resource delete failed this
 		// cycle) are retained so the planner keeps retrying the delete.
 		for _, v := range wrt.Status.Versions {
-			if _, ok := coveredByApply[v.BuildID]; ok {
+			if _, ok := coveredByApply[k8s.WorkerResourceCopyOf(v)]; ok {
 				continue
 			}
-			if _, ok := deleted[v.BuildID]; ok {
+			if _, ok := deleted[k8s.WorkerResourceCopyOf(v)]; ok {
 				continue
 			}
 			versions = append(versions, v)
 		}
 
-		// Compute the top-level Ready condition.
-		// True:  all active Build IDs applied at the current generation (or already current —
-		//        skipped ones carry a non-zero LastAppliedGeneration from their last successful apply).
-		// False: one or more apply calls failed this cycle.
-		condStatus := metav1.ConditionTrue
-		condReason := temporaliov1alpha1.ReasonWRTAllVersionsApplied
-		condMessage := ""
-		if anyFailed {
-			condStatus = metav1.ConditionFalse
-			condReason = temporaliov1alpha1.ReasonWRTApplyFailed
-			// Use the first apply error as the condition message; full per-version details
-			// are available in status.versions[*].applyError.
-			for _, result := range results {
-				if result.err != nil {
-					condMessage = result.err.Error()
-					break
+		var condChanged bool
+		if anyFailed || !statusUnknown || missingGroup {
+			// Compute the top-level Ready condition.
+			// True:  all active Build IDs applied at the current generation (or already current —
+			//        skipped ones carry a non-zero LastAppliedGeneration from their last successful apply).
+			// False: one or more apply calls failed this cycle, or the WRT's group is missing.
+			condStatus := metav1.ConditionTrue
+			condReason := temporaliov1alpha1.ReasonWRTAllVersionsApplied
+			condMessage := ""
+			switch {
+			case missingGroup:
+				condStatus = metav1.ConditionFalse
+				condReason = temporaliov1alpha1.ReasonWRTWorkerGroupNotFound
+				quoted := make([]string, 0, len(missingGroups[key]))
+				for _, group := range missingGroups[key] {
+					quoted = append(quoted, strconv.Quote(group))
+				}
+				condMessage = fmt.Sprintf("WorkerDeployment %q has no group %s", workerDeploy.Name, strings.Join(quoted, ", "))
+			case anyFailed:
+				condStatus = metav1.ConditionFalse
+				condReason = temporaliov1alpha1.ReasonWRTApplyFailed
+				// Use the first apply error as the condition message; full per-version details
+				// are available in status.versions[*].applyError.
+				for _, result := range results {
+					if result.err != nil {
+						condMessage = result.err.Error()
+						break
+					}
 				}
 			}
-		}
-		apimeta.SetStatusCondition(&wrt.Status.Conditions, metav1.Condition{
-			Type:               temporaliov1alpha1.ConditionReady,
-			Status:             condStatus,
-			Reason:             condReason,
-			Message:            condMessage,
-			ObservedGeneration: wrt.Generation,
-		})
+			condChanged = apimeta.SetStatusCondition(&wrt.Status.Conditions, metav1.Condition{
+				Type:               temporaliov1alpha1.ConditionReady,
+				Status:             condStatus,
+				Reason:             condReason,
+				Message:            condMessage,
+				ObservedGeneration: wrt.Generation,
+			})
 
-		// Sort the versions by BuildID for deterministic status output.
+			// Translate the same outcome into the kstatus abnormal-true conditions, so
+			// Argo Rollouts and Helm --wait can tell a template that will never apply from
+			// one that is still being retried. Ready=False alone reads as InProgress to
+			// kstatus, which is why a bad template used to hang a deploy until timeout.
+			//
+			// Both are always written, and at most one of them is True. kstatus scans
+			// status.conditions in array order and returns on the first match, so an object
+			// carrying both as True would get a verdict decided by insertion order.
+			// Writing the inactive one as False rather than removing it keeps every
+			// condition this controller owns present on every object.
+			//
+			// A missing group is Reconciling, not Stalled, for the same reason a missing
+			// WorkerDeployment is: the group may be added to the WorkerDeployment later.
+			stalledStatus, reconcilingStatus := metav1.ConditionFalse, metav1.ConditionFalse
+			switch {
+			case anyTerminal:
+				stalledStatus = metav1.ConditionTrue
+			case anyFailed, missingGroup:
+				reconcilingStatus = metav1.ConditionTrue
+			}
+			if apimeta.SetStatusCondition(&wrt.Status.Conditions, metav1.Condition{
+				Type:               temporaliov1alpha1.ConditionStalled,
+				Status:             stalledStatus,
+				Reason:             condReason,
+				Message:            condMessage,
+				ObservedGeneration: wrt.Generation,
+			}) {
+				condChanged = true
+			}
+			if apimeta.SetStatusCondition(&wrt.Status.Conditions, metav1.Condition{
+				Type:               temporaliov1alpha1.ConditionReconciling,
+				Status:             reconcilingStatus,
+				Reason:             condReason,
+				Message:            condMessage,
+				ObservedGeneration: wrt.Generation,
+			}) {
+				condChanged = true
+			}
+
+			// Record that this generation was processed, whatever the outcome. kstatus
+			// checks this before it looks at any condition, so leaving it behind would
+			// mask both of the conditions set above.
+			if wrt.Status.ObservedGeneration != wrt.Generation {
+				wrt.Status.ObservedGeneration = wrt.Generation
+				condChanged = true
+			}
+		}
+		// A WRT with a missing group is visited every cycle, so write only when something changed.
+		if allSkipped && len(deleted) == 0 && !condChanged {
+			continue
+		}
+
+		// Sort the versions by BuildID and group for deterministic status output.
 		slices.SortFunc(versions, func(a, b temporaliov1alpha1.WorkerResourceTemplateVersionStatus) int {
-			return strings.Compare(a.BuildID, b.BuildID)
+			return cmp.Or(strings.Compare(a.BuildID, b.BuildID), strings.Compare(a.WorkerGroup, b.WorkerGroup))
 		})
 		wrt.Status.Versions = versions
 		if err := r.Status().Update(ctx, wrt); err != nil {
@@ -678,6 +845,73 @@ func (r *WorkerDeploymentReconciler) executeWRTOperations(
 	}
 
 	return errors.Join(append(applyErrs, statusErrs...)...)
+}
+
+// pruneWRTStatusEntries removes the WRT status entries of the rendered resources in deleted,
+// whose delete was confirmed, and leaves the rest of each WRT status unchanged.
+func (r *WorkerDeploymentReconciler) pruneWRTStatusEntries(ctx context.Context, deleted []planner.WorkerResourceRef) error {
+	copiesByWRT := make(map[types.NamespacedName]map[k8s.WorkerResourceCopy]struct{})
+	for _, ref := range deleted {
+		if ref.WRTName == "" || ref.BuildID == "" {
+			continue
+		}
+		key := types.NamespacedName{Namespace: ref.Namespace, Name: ref.WRTName}
+		if copiesByWRT[key] == nil {
+			copiesByWRT[key] = make(map[k8s.WorkerResourceCopy]struct{})
+		}
+		copiesByWRT[key][ref.Copy()] = struct{}{}
+	}
+
+	var errs []error
+	for key, copies := range copiesByWRT {
+		wrt := &temporaliov1alpha1.WorkerResourceTemplate{}
+		if err := r.Get(ctx, key, wrt); err != nil {
+			errs = append(errs, fmt.Errorf("get WRT %s to prune status entries: %w", key, err))
+			continue
+		}
+		n := len(wrt.Status.Versions)
+		wrt.Status.Versions = slices.DeleteFunc(wrt.Status.Versions, func(v temporaliov1alpha1.WorkerResourceTemplateVersionStatus) bool {
+			_, ok := copies[k8s.WorkerResourceCopyOf(v)]
+			return ok
+		})
+		// Most confirmed deletes are NotFound for a copy that never had an entry.
+		if len(wrt.Status.Versions) == n {
+			continue
+		}
+		if err := r.Status().Update(ctx, wrt); err != nil {
+			errs = append(errs, fmt.Errorf("prune status entries of WRT %s: %w", key, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// isTerminalWorkerResourceError reports whether a WorkerResourceTemplate failure can
+// only be resolved by a human changing something, and so should be surfaced through the
+// kstatus Stalled condition (making kstatus report Failed) rather than left looking
+// like work still in progress.
+//
+// renderFailed covers a spec.template that could not be rendered at all. This is always
+// terminal, since only a spec change can fix it. For SSA apply failures only the API
+// server's own outright rejections count: Invalid (the rendered object does not satisfy
+// the target schema), Forbidden and Unauthorized (the controller lacks RBAC for the
+// templated kind), BadRequest, and the media-type/method rejections.
+//
+// Everything else (Conflict, timeouts, TooManyRequests, transport errors) is retried
+// on the next reconcile and deliberately keeps reporting InProgress, so a blip cannot
+// abort a deploy. This mirrors the stalledReasons split in worker_controller.go.
+func isTerminalWorkerResourceError(err error, renderFailed bool) bool {
+	if err == nil {
+		return false
+	}
+	if renderFailed {
+		return true
+	}
+	return apierrors.IsInvalid(err) ||
+		apierrors.IsForbidden(err) ||
+		apierrors.IsUnauthorized(err) ||
+		apierrors.IsBadRequest(err) ||
+		apierrors.IsUnsupportedMediaType(err) ||
+		apierrors.IsMethodNotSupported(err)
 }
 
 // deleteDeprecatedVersions prunes the Temporal server-side Worker Deployment Version
@@ -720,8 +954,10 @@ func (r *WorkerDeploymentReconciler) deleteDeprecatedVersions(
 	temporalClient sdkclient.Client,
 	p *plan,
 ) {
-	identity := getControllerIdentity()
-	markedForDeletion := make([]*appsv1.Deployment, 0, len(p.DeleteDeployments))
+	identity := config.GetControllerIdentity()
+	// A version's group Deployments are pruned together, after one DeleteVersion call.
+	var buildIDs []string
+	deploymentsByBuildID := make(map[string][]*appsv1.Deployment)
 	for _, d := range p.DeleteDeployments {
 		buildID, ok := d.GetLabels()[k8s.BuildIDLabel]
 		if !ok {
@@ -732,8 +968,17 @@ func (r *WorkerDeploymentReconciler) deleteDeprecatedVersions(
 			l.Info("deployment has no build ID label, leaving the k8s Deployment alone", "deployment", d.Name)
 			continue
 		}
+		if _, seen := deploymentsByBuildID[buildID]; !seen {
+			buildIDs = append(buildIDs, buildID)
+		}
+		deploymentsByBuildID[buildID] = append(deploymentsByBuildID[buildID], d)
+	}
+
+	markedForDeletion := make([]*appsv1.Deployment, 0, len(p.DeleteDeployments))
+	for _, buildID := range buildIDs {
+		deployments := deploymentsByBuildID[buildID]
 		if isVersionNotRegistered(workerDeploy, buildID) {
-			markedForDeletion = append(markedForDeletion, d)
+			markedForDeletion = append(markedForDeletion, deployments...)
 			continue
 		}
 		backoffKey := k8s.ComputeWorkerDeploymentName(workerDeploy) + "/" + buildID
@@ -763,8 +1008,8 @@ func (r *WorkerDeploymentReconciler) deleteDeprecatedVersions(
 		if err != nil {
 			var notFound *serviceerror.NotFound
 			if !errors.As(err, &notFound) {
-				l.Info("could not delete worker deployment version, keeping its k8s Deployment to reconcile",
-					"buildID", buildID, "deployment", d.Name, "error", err)
+				l.Info("could not delete worker deployment version, keeping its k8s Deployments to reconcile",
+					"buildID", buildID, "error", err)
 				r.noteVersionDeleteFailure(backoffKey)
 				continue
 			}
@@ -773,7 +1018,7 @@ func (r *WorkerDeploymentReconciler) deleteDeprecatedVersions(
 			l.Info("deleted deprecated worker deployment version", "buildID", buildID)
 		}
 		r.noteVersionDeleteSuccess(backoffKey)
-		markedForDeletion = append(markedForDeletion, d)
+		markedForDeletion = append(markedForDeletion, deployments...)
 	}
 	p.DeleteDeployments = markedForDeletion
 }
@@ -866,16 +1111,22 @@ func (r *WorkerDeploymentReconciler) executePlan(
 	// on the next reconcile instead of orphaning the record; see deleteDeprecatedVersions.
 	r.deleteDeprecatedVersions(ctx, l, workerDeploy, deploymentHandler, temporalClient, p)
 	deletedWorkerResources, err := r.executeK8sOperations(ctx, l, workerDeploy, p)
+	// On error, executeWRTOperations does not run, so prune the status entries of the copies
+	// deleted above here. If the version of such a copy is selected again before a cycle
+	// succeeds, its stale LastAppliedHash would skip the apply that recreates it.
+	pruneOnError := func(err error) error {
+		return errors.Join(err, r.pruneWRTStatusEntries(ctx, deletedWorkerResources))
+	}
 	if err != nil {
-		return err
+		return pruneOnError(err)
 	}
 
 	if err := r.startTestWorkflows(ctx, l, workerDeploy, temporalClient, p); err != nil {
-		return err
+		return pruneOnError(err)
 	}
 
 	if err := r.updateVersionConfig(ctx, l, workerDeploy, deploymentHandler, p); err != nil {
-		return err
+		return pruneOnError(err)
 	}
 
 	r.ensureWRTOwnerRefs(ctx, l, p)

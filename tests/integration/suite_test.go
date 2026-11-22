@@ -1,5 +1,4 @@
 //go:build integration
-// +build integration
 
 package integration
 
@@ -996,8 +995,8 @@ func TestIntegration(t *testing.T) {
 	})
 
 	// WRT integration tests: per-Build-ID HPA owner refs and scaleTargetRef injection,
-	// PDB matchLabels injection, multiple WRTs on the same TWD, template variable rendering,
-	// multi-version rollout copies, SSA apply failure handling, and SSA idempotency.
+	// PDB matchLabels injection, multiple WRTs on the same TWD, multi-version rollout
+	// copies, SSA apply failure handling, and SSA idempotency.
 	// Each entry uses the standard runner; WRT-specific assertions are in ValidatorFunction.
 	for _, tc := range wrtTestCases() {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1009,19 +1008,23 @@ func TestIntegration(t *testing.T) {
 	// Conditions and events tests
 	runConditionsAndEventsTests(t, k8sClient, mgr, ts, testNamespace.Name)
 
+	// kstatus verdict tests: assert what Helm --wait and Flux conclude from the
+	// conditions written above, read back from the real API server.
+	runKstatusTests(t, k8sClient, mgr, ts, testNamespace.Name)
+
 	// Version-summary divergence safety test
 	runNotRegisteredVersionTests(t, k8sClient, clientPool, ts, testNamespace.Name)
 
-	// Rate limit test: uses a dedicated server to avoid interfering with the tests above.
-	// Ten TWDs in the same Temporal namespace produce 10 concurrent DescribeWorkerDeployment
-	// calls per second against a 1 RPS limit, reliably triggering ResourceExhausted errors.
-	dcRateLimit := dynamicconfig.NewMemoryClient()
-	dcRateLimit.OverrideValue(dynamicconfig.MakeKey("frontend.globalNamespaceWorkerDeploymentReadRPS"), 1)
-	tsRateLimit := temporaltest.NewServer(
-		temporaltest.WithT(t),
-		temporaltest.WithBaseServerOptions(temporal.WithDynamicConfigClient(dcRateLimit)),
-	)
-	runRateLimitTest(t, k8sClient, tsRateLimit, testNamespace.Name)
+	t.Run("draining-deployment-replicas", func(t *testing.T) {
+		testDrainingDeploymentReplicas(t, k8sClient, ts, testNamespace.Name)
+	})
+
+	t.Run("wrt-version-statuses-current-to-draining", func(t *testing.T) {
+		testWRTVersionStatusesCurrentToDraining(t, k8sClient, ts, testNamespace.Name)
+	})
+
+	// Worker group tests sunset a version, so they need pollers to expire quickly too.
+	runWorkerGroupTests(t, k8sClient, tsShortTTL, testNamespace.Name)
 
 	// Deletion cleanup tests — use short poller TTL server so active pollers expire
 	// in 1s rather than the default 5 minutes, keeping test runtime reasonable.

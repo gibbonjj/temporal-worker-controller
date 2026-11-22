@@ -68,7 +68,7 @@ When you update the image, the controller automatically:
 1. 🆕 Creates a new deployment with your updated worker
 2. 📊 Gradually routes new workflows and AutoUpgrade workflows to the new version  
 3. 🔒 Keeps Pinned workflows running on their original version (guaranteed safety)
-4. 🧹 Automatically scales down and cleans up old versions once they are [drained](https://docs.temporal.io/production-deployment/worker-deployments/worker-versioning#sunsetting-an-old-deployment-version)
+4. 🧹 Automatically scales down and cleans up old versions once they are [drained](https://docs.temporal.io/production-deployment/worker-deployments/worker-versioning/sunset-and-gc#sunsetting-an-old-deployment-version)
 
 ## 🏃‍♂️ Getting Started
 
@@ -172,7 +172,7 @@ helm install temporal-worker-controller <chart> \
 - ✅ **Automatic lifecycle scaling** - Scales down worker versions when no longer needed
 - ✅ **Deletion of resources** associated with drained Worker Deployment Versions
 - ✅ **Multiple rollout strategies**: `Manual`, `AllAtOnce`, and `Progressive` rollouts
-- ✅ **Gate workflows** - Test new versions with a [pre-deployment test](https://docs.temporal.io/production-deployment/worker-deployments/worker-versioning#adding-a-pre-deployment-test) before routing real traffic to them
+- ✅ **Gate workflows** - Test new versions with a [pre-deployment test](https://docs.temporal.io/production-deployment/worker-deployments/worker-versioning/sunset-and-gc#adding-a-pre-deployment-test) before routing real traffic to them
 - ✅ **Per-version attached resources** - Attach HPAs, PodDisruptionBudgets, or any namespaced Kubernetes resource to each worker version with running workers via [`WorkerResourceTemplate`](docs/worker-resource-templates.md) — this is also the recommended path for metric-based and backlog-based autoscaling
 
 
@@ -193,7 +193,7 @@ The Temporal Worker Controller eliminates this operational overhead by automatin
 
 - **Automatic Temporal integration** - Registers versions and manages routing without manual API calls
 - **Kubernetes-native workflow** - Update a single custom resource, get full [rainbow deployments](https://docs.temporal.io/production-deployment/worker-deployments/worker-versioning#deployment-systems)  
-- **Intelligent cleanup** - Monitors version [drainage](https://docs.temporal.io/production-deployment/worker-deployments/worker-versioning#sunsetting-an-old-deployment-version) and automatically removes unused resources
+- **Intelligent cleanup** - Monitors version [drainage](https://docs.temporal.io/production-deployment/worker-deployments/worker-versioning/sunset-and-gc#sunsetting-an-old-deployment-version) and automatically removes unused resources
 - **Built-in rollout strategies** - Progressive, AllAtOnce, and Manual with configurable safety controls
 
 ## 📖 Documentation
@@ -245,4 +245,4 @@ This project is licensed under the [MIT License](LICENSE).
 
 ---
 
-**Questions?** Reach out to [@jlegrone](https://github.com/jlegrone) or the [#safe-deploys](https://temporalio.slack.com/archives/C07MDJ6S3HP) channel on Temporal Slack!
+**Questions?** Reach out on the [#temporal-workers](https://temporalio.slack.com/archives/C07MDJ6S3HP) channel on [Temporal Slack](https://temporal.io/community)!

@@ -52,19 +52,47 @@ const (
 // prefix is truncated. The buildID is therefore always uniquely represented via the hash,
 // regardless of how long wdName or wrtName are.
 func ComputeWorkerResourceTemplateName(wdName, wrtName, buildID string) string {
-	// Hash the full triple first, before any truncation.
-	h := sha256.Sum256([]byte(wdName + wrtName + buildID))
-	hashSuffix := hex.EncodeToString(h[:workerResourceTemplateHashLen/2]) // 4 bytes → 8 hex chars
+	return hashSuffixedName(wdName+wrtName+buildID, wdName+ResourceNameSeparator+wrtName+ResourceNameSeparator+buildID)
+}
 
-	// Build the human-readable prefix and truncate so the total fits in maxLen.
-	// suffixLen = len("-") + workerResourceTemplateHashLen
-	const suffixLen = 1 + workerResourceTemplateHashLen
-	raw := CleanStringForDNS(wdName + ResourceNameSeparator + wrtName + ResourceNameSeparator + buildID)
-	prefix := TruncateString(raw, workerResourceTemplateMaxNameLen-suffixLen)
+// ComputeWorkerResourceTemplateGroupName names the copy of a worker resource template for one
+// worker group's Deployment in a version. The default group keeps the name from
+// ComputeWorkerResourceTemplateName, so templates of WorkerDeployments without groups keep
+// their copies.
+func ComputeWorkerResourceTemplateGroupName(wdName, wrtName, group, buildID string) string {
+	if group == "" || group == temporaliov1alpha1.DefaultWorkerGroupName {
+		return ComputeWorkerResourceTemplateName(wdName, wrtName, buildID)
+	}
+	return hashSuffixedName(
+		wdName+WorkerDeploymentNameSeparator+wrtName+WorkerDeploymentNameSeparator+group+WorkerDeploymentNameSeparator+buildID,
+		wdName+ResourceNameSeparator+wrtName+ResourceNameSeparator+group+ResourceNameSeparator+buildID,
+	)
+}
+
+// WorkerResourceCopy identifies one rendered copy of a worker resource template: the Build ID
+// of a version and the worker group of its Deployment.
+type WorkerResourceCopy struct {
+	BuildID     string
+	WorkerGroup string
+}
+
+// WorkerResourceCopyOf returns the copy a status entry refers to. An entry without a group
+// refers to the default group.
+func WorkerResourceCopyOf(v temporaliov1alpha1.WorkerResourceTemplateVersionStatus) WorkerResourceCopy {
+	group := v.WorkerGroup
+	if group == "" {
+		group = temporaliov1alpha1.DefaultWorkerGroupName
+	}
+	return WorkerResourceCopy{BuildID: v.BuildID, WorkerGroup: group}
+}
+
+// hashSuffixedName returns readable, made DNS-safe and cut to fit in 47 characters,
+// followed by an 8-hex hash of hashInput taken before any truncation.
+func hashSuffixedName(hashInput, readable string) string {
+	suffix := ResourceNameSeparator + HashString(hashInput)[:workerResourceTemplateHashLen]
+	prefix := TruncateString(CleanStringForDNS(readable), workerResourceTemplateMaxNameLen-len(suffix))
 	// Trim any trailing separator that results from truncating mid-segment.
-	prefix = strings.TrimRight(prefix, ResourceNameSeparator)
-
-	return prefix + ResourceNameSeparator + hashSuffix
+	return strings.TrimRight(prefix, ResourceNameSeparator) + suffix
 }
 
 // RenderWorkerResourceTemplate produces the Unstructured object to apply via SSA for a given
@@ -72,8 +100,9 @@ func ComputeWorkerResourceTemplateName(wdName, wrtName, buildID string) string {
 //
 // Processing order:
 //  1. Unmarshal spec.template into an Unstructured
-//  2. Auto-inject scaleTargetRef and matchLabels (Layer 1)
-//  3. Set metadata (name, namespace, labels, owner reference)
+//  2. Substitute per-version metric tokens in string values
+//  3. Auto-inject scaleTargetRef, matchLabels, and KEDA temporal trigger metadata
+//  4. Set metadata (name, namespace, labels, owner reference)
 func RenderWorkerResourceTemplate(
 	wrt *temporaliov1alpha1.WorkerResourceTemplate,
 	deployment *appsv1.Deployment,
@@ -94,6 +123,11 @@ func RenderWorkerResourceTemplate(
 	serverWDName := computeWorkerDeploymentName(wrt.Namespace, wdName)
 
 	selectorLabels := ComputeSelectorLabels(wdName, buildID)
+	if deployment.Spec.Selector != nil {
+		if group, ok := deployment.Spec.Selector.MatchLabels[WorkerGroupLabel]; ok {
+			selectorLabels = ComputeWorkerGroupSelectorLabels(wdName, buildID, group)
+		}
+	}
 
 	// Labels the controller appends to every metrics[*].external.metric.selector.matchLabels
 	// that is present in the template. These identify the exact per-version Prometheus series.
@@ -108,7 +142,10 @@ func RenderWorkerResourceTemplate(
 		metricSelectorLabels = stripMetricLabelPrefix(metricSelectorLabels, "temporal_")
 	}
 
-	// Step 2: auto-inject scaleTargetRef, selector.matchLabels, metric selector labels,
+	// Step 2: per-version metric tokens. Values match metricSelectorLabels.
+	substituteMetricTemplateVars(obj.Object, metricSelectorLabels)
+
+	// Step 3: auto-inject scaleTargetRef, selector.matchLabels, metric selector labels,
 	// and KEDA Temporal trigger metadata. NestedFieldNoCopy returns a live reference so
 	// mutations are reflected in obj.Object directly.
 	if specRaw, ok, _ := unstructured.NestedFieldNoCopy(obj.Object, "spec"); ok {
@@ -117,8 +154,8 @@ func RenderWorkerResourceTemplate(
 		}
 	}
 
-	// Step 3: set metadata using Unstructured typed methods.
-	resourceName := ComputeWorkerResourceTemplateName(wrt.Spec.EffectiveWorkerDeploymentName(), wrt.Name, buildID)
+	// Step 4: set metadata using Unstructured typed methods.
+	resourceName := ComputeWorkerResourceTemplateGroupName(wrt.Spec.EffectiveWorkerDeploymentName(), wrt.Name, WorkerGroupName(deployment), buildID)
 	obj.SetName(resourceName)
 	obj.SetNamespace(wrt.Namespace)
 
@@ -152,6 +189,45 @@ func RenderWorkerResourceTemplate(
 	return obj, nil
 }
 
+// substituteMetricTemplateVars replaces {{<key>}} in every string under v for each
+// key in vars. vars are the metric selector labels for this render, so the tokens
+// match the injected matchLabels, including the unprefixed names when prefix
+// stripping is enabled. Only the exact token is replaced.
+func substituteMetricTemplateVars(v interface{}, vars map[string]string) {
+	switch typed := v.(type) {
+	case map[string]interface{}:
+		for key, child := range typed {
+			if s, ok := child.(string); ok {
+				typed[key] = substituteMetricTemplateString(s, vars)
+				continue
+			}
+			substituteMetricTemplateVars(child, vars)
+		}
+	case []interface{}:
+		for i, child := range typed {
+			if s, ok := child.(string); ok {
+				typed[i] = substituteMetricTemplateString(s, vars)
+				continue
+			}
+			substituteMetricTemplateVars(child, vars)
+		}
+	}
+}
+
+func substituteMetricTemplateString(s string, vars map[string]string) string {
+	if !strings.Contains(s, "{{") {
+		return s
+	}
+	for key, value := range vars {
+		token := "{{" + key + "}}"
+		if !strings.Contains(s, token) {
+			continue
+		}
+		s = strings.ReplaceAll(s, token, value)
+	}
+	return s
+}
+
 // autoInjectFields applies the controller-owned injections to the top-level spec map:
 //
 //   - spec.selector.matchLabels: injected ONLY at this exact path when {} (empty).
@@ -172,6 +248,10 @@ func RenderWorkerResourceTemplate(
 //
 //   - scaleTargetRef: injected anywhere in the spec tree when {} (empty), via
 //     injectScaleTargetRefRecursive. Unambiguous across all supported resource types.
+//
+//   - spec.targetRef: injected ONLY at this exact path when {} (empty),
+//     with the same value as scaleTargetRef. Unlike scaleTargetRef, "targetRef" is a common key
+//     in other CRDs, so it is not injected recursively.
 func autoInjectFields(spec map[string]interface{}, deploymentName, serverWDName, buildID, temporalNamespace string, podSelectorLabels map[string]string, metricSelectorLabels map[string]string) {
 	// spec.selector.matchLabels: {} opt-in sentinel.
 	if sel, ok := spec["selector"].(map[string]interface{}); ok {
@@ -190,6 +270,11 @@ func autoInjectFields(spec map[string]interface{}, deploymentName, serverWDName,
 
 	// scaleTargetRef: inject anywhere in the spec tree.
 	injectScaleTargetRefRecursive(spec, deploymentName)
+
+	// spec.targetRef: {} opt-in sentinel, this exact path only.
+	if isEmptyMap(spec["targetRef"]) {
+		_ = unstructured.SetNestedMap(spec, buildScaleTargetRef(deploymentName), "targetRef")
+	}
 }
 
 func stripMetricLabelPrefix(labels map[string]string, prefix string) map[string]string {
@@ -389,13 +474,18 @@ func ComputeRenderedObjectHash(resource *unstructured.Unstructured) string {
 	return hex.EncodeToString(h[:RenderedHashLen/2]) // 8 bytes → 16 hex chars
 }
 
-// WorkerResourceTemplateVersionStatusForBuildID builds a per-Build-ID status entry.
+// WorkerResourceTemplateVersionStatusForBuildID builds a status entry for the copy of one
+// version's Deployment of group; "" or the default group leaves the entry without a group.
 // generation is the WRT metadata.generation at the time of the apply; pass 0 on error
 // to preserve the last-known-good generation. hash is the controller-internal rendered-object
 // hash used for the SSA skip optimisation (pass "" on error).
-func WorkerResourceTemplateVersionStatusForBuildID(buildID, resourceName string, generation int64, hash, applyError string) temporaliov1alpha1.WorkerResourceTemplateVersionStatus {
+func WorkerResourceTemplateVersionStatusForBuildID(buildID, group, resourceName string, generation int64, hash, applyError string) temporaliov1alpha1.WorkerResourceTemplateVersionStatus {
+	if group == temporaliov1alpha1.DefaultWorkerGroupName {
+		group = ""
+	}
 	return temporaliov1alpha1.WorkerResourceTemplateVersionStatus{
 		BuildID:               buildID,
+		WorkerGroup:           group,
 		ResourceName:          resourceName,
 		LastAppliedGeneration: generation,
 		ApplyError:            applyError,

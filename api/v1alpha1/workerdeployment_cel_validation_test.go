@@ -56,6 +56,30 @@ var _ = Describe("WorkerDeployment CRD CEL validation", func() {
 		Expect(k8sClient.Create(ctx, baseTWD("valid-worker"))).To(Succeed())
 	})
 
+	It("rejects drainingDeployment.replicas below 1", func() {
+		twd := baseTWD("draining-zero")
+		twd.Spec.DrainingDeployment = &DrainingDeploymentSpec{Replicas: ptr(int32(0))}
+		err := k8sClient.Create(ctx, twd)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("spec.drainingDeployment.replicas"))
+	})
+
+	It("accepts custom deploymentLabels", func() {
+		twd := baseTWD("custom-deployment-labels")
+		twd.Spec.DeploymentLabels = map[string]string{"team": "payments"}
+		Expect(k8sClient.Create(ctx, twd)).To(Succeed())
+	})
+
+	It("rejects deploymentLabels that set controller-managed keys", func() {
+		for i, key := range []string{"temporal.io/build-id", "temporal.io/deployment-name"} {
+			twd := baseTWD(fmt.Sprintf("reserved-deployment-label-%d", i))
+			twd.Spec.DeploymentLabels = map[string]string{key: "user-supplied"}
+			err := k8sClient.Create(ctx, twd)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("are managed by the controller"))
+		}
+	})
+
 	It("rejects name longer than 63 characters", func() {
 		twd := baseTWD(strings.Repeat("a", 64))
 		err := k8sClient.Create(ctx, twd)
@@ -306,6 +330,111 @@ var _ = Describe("WorkerDeployment CRD CEL validation", func() {
 		err := k8sClient.Create(ctx, twd)
 		Expect(err).To(HaveOccurred())
 		Expect(err.Error()).To(ContainSubstring("objectRef.namespace is not supported"))
+	})
+
+	groupTemplate := func() corev1.PodTemplateSpec {
+		return corev1.PodTemplateSpec{
+			Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "worker", Image: "worker:latest"}}},
+		}
+	}
+	groupedTWD := func(name string, groups ...WorkerGroup) *WorkerDeployment {
+		twd := baseTWD(name)
+		twd.Spec.Deployment = nil
+		twd.Spec.WorkerGroups = groups
+		return twd
+	}
+	group := func(name string) WorkerGroup {
+		return WorkerGroup{Name: name, Deployment: appsv1.DeploymentSpec{Template: groupTemplate()}}
+	}
+
+	It("accepts groups without a selector", func() {
+		twd := groupedTWD("with-groups", group("workflows"), group("gpu-parse"))
+		twd.Spec.WorkerGroups[0].Deployment.Replicas = ptr(int32(2))
+		Expect(k8sClient.Create(ctx, twd)).To(Succeed())
+	})
+
+	It("rejects a spec with none of deployment, template or groups", func() {
+		err := k8sClient.Create(ctx, groupedTWD("no-workers"))
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("one of deployment, template or workerGroups must be set"))
+	})
+
+	It("rejects groups combined with deployment", func() {
+		twd := groupedTWD("groups-and-deployment", group("workflows"))
+		twd.Spec.Deployment = baseTWD("tmp").Spec.Deployment
+		err := k8sClient.Create(ctx, twd)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("workerGroups cannot be combined with deployment or template"))
+	})
+
+	It("rejects groups combined with the deprecated template field", func() {
+		twd := groupedTWD("groups-and-template", group("workflows"))
+		tmpl := groupTemplate()
+		twd.Spec.Template = &tmpl
+		err := k8sClient.Create(ctx, twd)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("workerGroups cannot be combined with deployment or template"))
+	})
+
+	It("accepts drainingDeployment and deploymentLabels on a group", func() {
+		twd := groupedTWD("group-draining-labels", group("workflows"))
+		twd.Spec.WorkerGroups[0].DrainingDeployment = &DrainingDeploymentSpec{Replicas: ptr(int32(1))}
+		twd.Spec.WorkerGroups[0].DeploymentLabels = map[string]string{"team": "payments"}
+		Expect(k8sClient.Create(ctx, twd)).To(Succeed())
+	})
+
+	It("rejects top-level drainingDeployment or deploymentLabels with groups", func() {
+		draining := groupedTWD("groups-and-draining", group("workflows"))
+		draining.Spec.DrainingDeployment = &DrainingDeploymentSpec{Replicas: ptr(int32(1))}
+		labels := groupedTWD("groups-and-labels", group("workflows"))
+		labels.Spec.DeploymentLabels = map[string]string{"team": "payments"}
+		for _, twd := range []*WorkerDeployment{draining, labels} {
+			err := k8sClient.Create(ctx, twd)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("set drainingDeployment and deploymentLabels on each worker group"))
+		}
+	})
+
+	It("rejects a group's drainingDeployment.replicas below 1", func() {
+		twd := groupedTWD("group-draining-zero", group("workflows"))
+		twd.Spec.WorkerGroups[0].DrainingDeployment = &DrainingDeploymentSpec{Replicas: ptr(int32(0))}
+		err := k8sClient.Create(ctx, twd)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("spec.workerGroups[0].drainingDeployment.replicas"))
+	})
+
+	It("rejects group deploymentLabels that set controller-managed keys", func() {
+		for i, key := range []string{"temporal.io/build-id", "temporal.io/deployment-name", "temporal.io/worker-group"} {
+			twd := groupedTWD(fmt.Sprintf("group-managed-label-%d", i), group("workflows"))
+			twd.Spec.WorkerGroups[0].DeploymentLabels = map[string]string{key: "user-supplied"}
+			err := k8sClient.Create(ctx, twd)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("are managed by the controller"))
+		}
+	})
+
+	It("rejects a group named default", func() {
+		err := k8sClient.Create(ctx, groupedTWD("group-default", group(DefaultWorkerGroupName)))
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("group name default is reserved"))
+	})
+
+	It("rejects duplicate group names", func() {
+		err := k8sClient.Create(ctx, groupedTWD("group-duplicate", group("activities"), group("activities")))
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("Duplicate value"))
+	})
+
+	It("rejects a group name that is not a DNS label", func() {
+		err := k8sClient.Create(ctx, groupedTWD("group-bad-name", group("Activities_1")))
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("spec.workerGroups[0].name"))
+	})
+
+	It("rejects a group name longer than 24 characters", func() {
+		err := k8sClient.Create(ctx, groupedTWD("group-long-name", group(strings.Repeat("a", 25))))
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("spec.workerGroups[0].name"))
 	})
 
 	It("rejects both template and deployment non-nil", func() {
